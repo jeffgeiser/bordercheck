@@ -169,6 +169,33 @@ class ReportTests(unittest.TestCase):
         self.assertIn("allowed_destinations", text)
 
 
+class VerdictTests(unittest.TestCase):
+    def _src(self, name, location="DE", hit=False, control=False, errors=()):
+        hits = [{"kind": "canary", "label": "canary", "where": "x"}] if hit else []
+        return {"name": name, "layer": "logs", "location": location, "egress": False, "hits": hits,
+                "positive_control": control, "errors": list(errors), "targets_scanned": 1, "truncated": []}
+
+    def _verdict(self, scan_res, allowed=("DE",)):
+        cfg = {"border": {"allowed_locations": list(allowed)}, "watch_destinations": []}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": {"canary": "CNRY-TEST-0001", "account": "99"}, "requests": []}
+        return report.build(cfg, run, scan_res)[1]
+
+    def test_pass_needs_a_positive_control_that_found_the_customer(self):
+        self.assertEqual(self._verdict([self._src("logs", hit=True, control=True), self._src("cache")])["verdict"], "pass")
+        self.assertEqual(self._verdict([self._src("cache")])["verdict"], "inconclusive")
+        self.assertEqual(self._verdict([self._src("logs", control=True)])["verdict"], "inconclusive")
+
+    def test_source_errors_make_a_clean_result_inconclusive(self):
+        res = self._verdict([self._src("logs", hit=True, control=True), self._src("cache", errors=["HTTP 401"])])
+        self.assertEqual(res["verdict"], "inconclusive")
+
+    def test_identifiers_outside_the_border_fail_even_without_a_control(self):
+        res = self._verdict([self._src("US analytics", location="US", hit=True)])
+        self.assertEqual(res["verdict"], "fail")
+        self.assertEqual(report.EXIT_CODES[res["verdict"]], 1)
+
+
 class RunTests(unittest.TestCase):
     def test_run_ids_cannot_escape_the_output_dir(self):
         with self.assertRaises(runs.RunIdError):
@@ -272,7 +299,8 @@ location = "DE"
 egress = true
 """)
                 with open(os.devnull, "w") as null, contextlib.redirect_stdout(null):
-                    self.assertEqual(cli.main(["-c", cfg_path, "all", "--yes", "--redact"]), 0)
+                    rc = cli.main(["-c", cfg_path, "all", "--yes", "--redact"])
+            self.assertEqual(rc, 1, "egress to a public API during the fault is a fail")
             self.assertFalse(os.path.exists(fault_file), "fault stop ran")
             run_id = os.listdir(os.path.join(d, "runs"))[0]
             run_path = os.path.join(d, "runs", run_id)
@@ -283,6 +311,8 @@ egress = true
             self.assertEqual([p["name"] for p in summary["places"]], ["App logs"])
             self.assertEqual(summary["egress_destinations"], {"Egress proxy": ["api.openai.com"]})
             self.assertEqual(summary["phases"]["fault"]["answered"], 2)
+            self.assertEqual(summary["verdict"], "fail")
+            self.assertIn("## Verdict: FAIL", text)
             self.assertIn("https://api.openai.com", text)
             self.assertNotIn("vllm.lab.internal", text)
             self.assertNotIn(d, text)

@@ -1,24 +1,47 @@
 # canarykit
 
-Follow a synthetic customer through your AI stack and find out where their data actually lands, including what happens when your in-country model goes down.
+A test harness for data residency in self-hosted AI stacks. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), takes the in-country model away so the gateway's failover runs, then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on.
 
-Most residency conversations stop at where the GPU sits. In our lab, the model sat in Germany and the customer's data still turned up in three places we hadn't planned for, plus a public API in the US once the local model failed over. Nobody got an error. canarykit lets you run the same test against your own architecture, in an afternoon, with no third-party dependencies to review.
+Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. canarykit tests behavior instead. In our lab, with the model in Frankfurt, the customer's data still turned up in stores nobody had listed, and in a public API in the US once the local model failed over. No request returned an error.
 
-## What it does
+Standard-library Python 3.11+, no dependencies, read-only against everything it scans.
 
-1. **Creates a synthetic customer** with a canary (`CNRY-XXXX-XXXX`) and an account number that exist nowhere else.
-2. **Sends requests through your normal entry point**, usually your AI gateway, and records who answered each one: status, timing, and the response fields or headers that identify the backend. Response bodies aren't stored.
-3. **Takes your local model away** using commands *you* write, after showing them and asking first, then sends the same requests again.
-4. **Searches the stores you list**, read-only: logs, tracing, caches, vector stores, object storage, egress logs. It looks for the canary (including base64-encoded copies), the account number and its own request ids.
-5. **Writes a report** organized by the four places residency can break: where the data lives, where it's processed, where model state lives, and where logs and the control plane live.
+## How it works
 
-The report answers questions like these:
+```
+ new ──> send baseline ──> fault start ──> send fault ──> fault stop ──> scan ──> report
+  │          │                  │               │                         │         │
+  │          └─ records who answered each request (status, timing,        │         └─ verdict + exit code
+  │             served-by headers/fields); bodies are never stored        │
+  │                                             your own commands,        └─ read-only search of
+  └─ synthetic customer: CNRY-XXXX-XXXX          shown and confirmed         every source you list
+     canary + 14-digit account number            before they run
+```
 
-- Did requests get answered during the outage, and by whom?
-- Which stores kept the customer's identifiers, and which of those are outside the border?
-- Did egress logs show traffic to public model APIs?
-- Which stores saw the requests but not the identifiers? That suggests redaction is working there.
-- Which layers didn't you check at all? Those are listed as **not checked**, never as clean.
+**What it searches for.** The canary exactly and lowercased, its base64 encoding at all three byte alignments (so it's found inside base64-encoded JSON, as tracing exporters and queues often store it), the account number plain and space-grouped, and the harness's own request ids. Request ids go somewhere your stack logs them but away from the identifiers (the OpenAI `user` field works well), which is how the report tells "this store saw the request but redacted the customer" from "this store isn't on the request path."
+
+**What it records.** For each hit: source, file or URL, line and byte offset, and which pattern matched. Never the matching content.
+
+**The four residency layers.** Every source is tagged with one, and a layer with no sources is reported as **not checked**, never as clean:
+
+| Layer | Typical stores |
+|---|---|
+| Data | system of record, data lake tables fed from the AI stack |
+| Processing | local model, fallback endpoints, batch jobs, external guardrail services |
+| Model state | semantic/prompt caches, vector stores, KV-cache offload, agent memory |
+| Logs and control plane | gateway and app logs, LLM tracing, raw event buckets, SIEM, egress proxy |
+
+## Verdict and exit codes
+
+| Verdict | Exit | Meaning |
+|---|---|---|
+| **pass** | 0 | No identifiers in sources outside the border, no egress to public model APIs the border doesn't allow, a positive control found the customer, and no source had errors |
+| **fail** | 1 | Identifiers were found outside the border, or egress logs show traffic to a disallowed model API. A found leak stands regardless of anything else |
+| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, or a different backend answered during the fault with no egress source to show where it runs |
+
+Config errors exit 2. The reasons are listed at the top of `report.md` and in `summary.json`.
+
+**Positive control.** Mark one source you know stores prompts with `positive_control = true` (with seeded mode, the system of record you loaded the customer into). If it doesn't find the customer, the scan itself is broken: a wrong time window, a missing permission, a log shipper that hasn't flushed. A clean result without a working positive control can't be told apart from a broken scan, so it's never a pass.
 
 ## Quick start
 
@@ -33,6 +56,7 @@ export GATEWAY_TOKEN=...                      # whatever your config references
 python -m canarykit all --dry-run             # sends nothing, runs no fault commands; shows them and
                                               # does a read-only scan to confirm sources are reachable
 python -m canarykit all                       # the real run; asks before each fault command
+echo $?                                       # 0 pass, 1 fail, 3 inconclusive
 ```
 
 The report lands in `runs/<run-id>/report.md`, with machine-readable detail in `summary.json` and `scan.json`. Add `--redact` (to `all` or `report`) for a copy you can share outside the team: it leaves out file paths, URLs, internal hostnames and your fault commands, and keeps public API hostnames.
@@ -48,6 +72,8 @@ python -m canarykit send  --run <id> --phase fault
 python -m canarykit scan   --run <id>
 python -m canarykit report --run <id>                     # add --redact for a shareable copy
 ```
+
+To gate a release or a change on it (in a pipeline that can reach staging), run `python -m canarykit all --yes --redact` and fail the job on a non-zero exit. `--yes` skips the confirmation before fault commands, so use it only where those commands are reviewed like code.
 
 ## Two ways to plant the customer
 
@@ -84,7 +110,8 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 | `docs/fault-injection.md` | Safe ways to take a local model away, and how to restore it |
 | `docs/where-to-look.md` | Checklist of stores that tend to keep copies |
 | `docs/sample-report.md` | What a report looks like, from a mock stack that fails over to a public API |
-| `canarykit/` | About 1,000 lines of standard-library Python |
+| `SECURITY.md` | What canarykit runs, reads, sends and stores, and how secrets are handled |
+| `canarykit/` | About 1,100 lines of standard-library Python |
 | `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
 
 ## Design choices you can check
@@ -94,4 +121,8 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 - Credentials aren't sent over plain `http://` (except to localhost), and redirects aren't followed, so a token can't be forwarded to another host.
 - Search results record locations and which pattern matched, never the matching content. Error messages are reduced to ones canarykit wrote; command stderr is shown on your terminal but not saved.
 - Run files are created readable by you only, since they name internal hosts and paths.
-- Fault commands are yours. The harness shows them, asks, logs when they ran, and tells you if the restore command failed.
+- Fault commands are yours. The harness shows them, asks, logs when they ran, always attempts the restore command (even after an error or Ctrl-C), and tells you if it failed.
+
+## License
+
+Apache License 2.0. See `LICENSE`.

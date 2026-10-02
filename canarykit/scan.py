@@ -177,6 +177,7 @@ def scan_sources(cfg, needles):
     for src in cfg.get("sources", []):
         entry = {k: src.get(k) for k in ("name", "type", "layer", "location")}
         entry["egress"] = bool(src.get("egress"))
+        entry["positive_control"] = bool(src.get("positive_control"))
         entry.update(hits=[], targets_scanned=0, errors=[], truncated=[])
         print(f"  scanning {src['name']} ...", end="", flush=True)
         try:

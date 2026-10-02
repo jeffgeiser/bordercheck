@@ -67,6 +67,37 @@ def _phase_summary(requests, public=None):
     }
 
 
+EXIT_CODES = {"pass": 0, "fail": 1, "inconclusive": 3}
+
+
+def _has_identifiers(s):
+    return any(h["kind"] in ("canary", "account") for h in s["hits"])
+
+
+def verdict(scan, outside, dests_out, phase_info):
+    """("pass" | "fail" | "inconclusive", reasons).
+
+    A leak that was found is real whatever else went wrong, so fail wins. A pass needs evidence
+    that scanning works (a positive control that found the customer) and no source errors.
+    """
+    fail = [f"identifiers found in {p['name']} ({p['location']}), outside the border" for p in outside]
+    fail += [f"egress to {d}, a public model API the border doesn't allow" for d in dests_out]
+    if fail:
+        return "fail", fail
+    unsure = []
+    controls = [s for s in scan if s.get("positive_control")]
+    if not controls:
+        unsure.append("no positive control configured, so a clean scan can't be told from a broken one")
+    unsure += [f"positive control {s['name']} didn't find the customer: fix that source before trusting clean results"
+               for s in controls if not _has_identifiers(s)]
+    unsure += [f"{s['name']} had errors, so it wasn't fully checked" for s in scan if s["errors"]]
+    base, fault = phase_info.get("baseline"), phase_info.get("fault")
+    has_egress = any(s.get("egress") for s in scan)
+    if fault and fault["answered"] and base and set(fault["served_by"]) - set(base["served_by"]) and not has_egress:
+        unsure.append("a different backend answered during the fault and no egress source shows where it runs")
+    return ("inconclusive", unsure) if unsure else ("pass", [])
+
+
 def build(cfg, run, scan, redact=False):
     """redact=True leaves out file paths, URLs, error text and fault commands, which name
     internal hosts and layout, so the report can be shared outside the team."""
@@ -106,6 +137,17 @@ def build(cfg, run, scan, redact=False):
     L.append(f"- Border: **{border_name}** (allowed locations: {', '.join(sorted(allowed))})")
     L.append(f"- Canary: `{run['record']['canary']}` · synthetic account `{run['record']['account']}`")
     L.append(f"- Run created: {_ts(run['created'])}\n")
+
+    result, reasons = verdict(scan, outside, dests_out, phase_info)
+    L.append(f"## Verdict: {result.upper()}\n")
+    L.append({"pass": "No identifiers outside the border, no egress to disallowed model APIs, and the "
+                      "positive control shows the scan works.",
+              "fail": "The synthetic customer's data crossed the border:",
+              "inconclusive": "Nothing crossed the border in what was scanned, but the evidence isn't complete:"}[result])
+    L.extend(f"- {r}" for r in reasons)
+    if "fault" not in phase_info:
+        L.append("- Note: no fault phase was run, so this says nothing about failover.")
+    L.append("")
 
     L.append("## Summary\n")
     if places:
@@ -204,14 +246,17 @@ def build(cfg, run, scan, redact=False):
     L.append("|---|---|---|---|---|")
     for s in scan:
         rid = any(h["kind"] == "run_id" for h in s["hits"])
-        ident = any(h["kind"] in ("canary", "account") for h in s["hits"])
-        if s["errors"]:
+        ident = _has_identifiers(s)
+        if s.get("positive_control") and not ident:
+            reading = "**positive control did not find the customer**: this source, or the scan, isn't working"
+        elif s["errors"]:
             reading = (f"{len(s['errors'])} error(s), see scan.json" if redact
                        else "errors: " + "; ".join(s["errors"])[:200])
         elif s["targets_scanned"] == 0:
             reading = "nothing to scan (empty), so this source was not really checked"
         elif ident:
-            reading = "holds the customer's identifiers"
+            reading = ("positive control: found, as expected" if s.get("positive_control")
+                       else "holds the customer's identifiers")
         elif rid:
             reading = "saw the requests but not the identifiers: redacted, hashed or not stored here"
         elif s.get("egress"):
@@ -239,7 +284,7 @@ def build(cfg, run, scan, redact=False):
     if redact:
         places = [{k: v for k, v in p.items() if k != "targets"} for p in places]
     summary = {
-        "run_id": run["run_id"], "border": border_name, "places": places,
+        "run_id": run["run_id"], "verdict": result, "reasons": reasons, "border": border_name, "places": places,
         "places_outside_border": len(outside), "phases": phase_info,
         "egress_destinations": dict(seen_egress),
         "egress_outside_border": dests_out,

@@ -1,4 +1,8 @@
-"""Command line: new -> send baseline -> fault start -> send fault -> fault stop -> scan -> report."""
+"""Command line: new -> send baseline -> fault start -> send fault -> fault stop -> scan -> report.
+
+`report` and `all` exit 0 for pass, 1 for fail (data crossed the border), 3 for inconclusive
+(no working positive control, or a source had errors), 2 for config errors.
+"""
 import argparse
 import json
 import time
@@ -71,6 +75,8 @@ def cmd_report(args):
     runs.write(cfg, args.run, "report.md", text)
     runs.write(cfg, args.run, "summary.json", json.dumps(summary, indent=2))
     print(f"report: {runs.run_dir(cfg, args.run)}/report.md")
+    print(f"verdict: {summary['verdict'].upper()}" + "".join(f"\n  - {r}" for r in summary["reasons"]))
+    return report.EXIT_CODES[summary["verdict"]]
 
 
 def cmd_all(args):
@@ -114,7 +120,7 @@ def cmd_all(args):
             print("fault not started; skipping the fault phase")
     print("\n== scan ==")
     cmd_scan(args)
-    cmd_report(args)
+    return cmd_report(args)
 
 
 def main(argv=None):
@@ -156,7 +162,7 @@ def main(argv=None):
 
     args = p.parse_args(argv)
     try:
-        args.fn(args)
+        rc = args.fn(args)
     except config.ConfigError as e:
         print(f"config error: {e}")
         return 2
@@ -168,4 +174,4 @@ def main(argv=None):
         print(f"\ninterrupted. If a fault was started, restore the local model with "
               f"`python -m canarykit fault stop{run}`.")
         return 130
-    return 0
+    return rc if isinstance(rc, int) and not isinstance(rc, bool) else 0

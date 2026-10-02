@@ -96,6 +96,10 @@ url = [
 headers = { Authorization = "Basic ${LANGFUSE_AUTH}" }
 layer = "logs"
 location = "DE"
+# Positive control: a source you know stores prompts. If it doesn't find the customer, the scan
+# itself is broken and the verdict is inconclusive, never pass. Move this to whichever source you
+# trust most (with seeded mode, the system of record you loaded seed_record.json into).
+positive_control = true
 
 # Langfuse v3 also writes every raw ingestion event to S3 (MinIO in the compose file) before
 # processing. It's a separate copy with its own retention.

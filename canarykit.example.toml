@@ -56,6 +56,7 @@ settle_seconds = 30
 # Where to look. Every source is read-only from canarykit's side; give it read-only credentials.
 # layer: data | processing | model_state | logs      location: where that store physically sits
 # type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
+# positive_control = true marks a source that must find the customer for the run to pass.
 # See docs/where-to-look.md for a checklist.
 # ---------------------------------------------------------------------------
 [[sources]]
@@ -88,6 +89,10 @@ url = [
 headers = { Authorization = "Basic ${TRACING_BASIC_AUTH}" }
 layer = "logs"
 location = "DE"
+# Positive control: a source you know stores prompts. If it doesn't find the customer, the scan
+# itself is broken and the verdict is inconclusive, never pass. Move this to whichever source you
+# trust most (with seeded mode, the system of record you loaded seed_record.json into).
+positive_control = true
 
 [[sources]]
 name = "Tracing raw event storage"
