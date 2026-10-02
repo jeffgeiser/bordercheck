@@ -1,5 +1,5 @@
 <!-- Sample output from a mock stack: a gateway that fails over to a public API when the local model is stopped. -->
-# canarykit report: run-20261001-193431-70fd
+# bordercheck report: run-20261001-193431-70fd
 
 - Environment: **staging**
 - Border: **Germany** (allowed locations: DE)

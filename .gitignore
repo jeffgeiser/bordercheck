@@ -1,4 +1,4 @@
-canarykit.toml
+bordercheck.toml
 runs/
 __pycache__/
 *.pyc

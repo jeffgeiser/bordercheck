@@ -1,0 +1,179 @@
+# bordercheck config. Copy to bordercheck.toml (git-ignored) and edit.
+# Secrets are read from environment variables with ${VAR}; never put them in this file.
+# In `headers` and `url`, bordercheck substitutes ${VAR}. In `command` strings it doesn't: the shell
+# expands ${VAR} itself, so quote it ("${VAR}") and a value can't change the command.
+
+environment = "staging"        # refuses "prod"/"production"/"live" unless you pass a deliberate flag
+output_dir = "runs"
+requests_per_phase = 20
+scan_delay_seconds = 60        # give log shippers and tracing exporters time to flush before scanning
+request_id_header = "X-Canary-Request-Id"   # sent with every request so you can find them in logs
+
+# The line data has to stay inside. Not only a country: a bloc ("EU"), a cloud region
+# ("eu-central-1"), your own infrastructure ("ONPREM"), a regulated zone ("PCI-ZONE"). Labels are
+# free text; each source's `location` uses the same labels.
+[border]
+name = "Germany"
+allowed_locations = ["DE"]     # sources whose `location` isn't listed here count as outside the border
+# Model API hostnames the border allows, e.g. an in-region cloud fallback you approved.
+# Egress to these is reported separately, not as leaving the border. See docs/enterprise-stacks.md.
+# allowed_destinations = ["bedrock-runtime.eu-central-1.amazonaws.com"]
+
+# ---------------------------------------------------------------------------
+# Where requests go in. Point this at the same entry point your applications use
+# (usually the AI gateway), not straight at the model, or you'll skip the failover logic.
+# ---------------------------------------------------------------------------
+[target]
+url = "https://ai-gateway.staging.internal/v1/chat/completions"
+method = "POST"
+headers = { Authorization = "Bearer ${GATEWAY_TOKEN}" }
+timeout_seconds = 60
+# ca_file = "/etc/ssl/certs/internal-ca.pem"
+
+# Placeholders: {{name}} {{role}} {{city}} {{product}} {{amount}} {{canary}} {{account}} {{email}}
+# {{phone}} {{iban}} {{request_id}} {{run_id}}. Email, phone and IBAN are in real formats from
+# reserved ranges, so the report shows which formats your redaction catches.
+# Direct mode: identifiers are in the prompt.
+prompt = "Customer {{name}} (ref {{canary}}, account {{account}}, IBAN {{iban}}, email {{email}}, phone {{phone}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
+# Seeded mode: load runs/<run>/seed_record.json into your test data first, then ask by name only:
+# prompt = "Summarize the open {{product}} for customer {{name}}."
+
+# {{prompt}} is JSON-escaped automatically. Put {{request_id}} somewhere your stack records it but
+# away from the identifiers (`user` is a standard OpenAI field most gateways log), so the coverage
+# check can tell "saw the request" from "saw the customer".
+body = '{"model": "default", "user": "{{request_id}}", "messages": [{"role": "user", "content": "{{prompt}}"}]}'
+
+# Fields that reveal who answered. Without these the report can't tell local from fallback.
+record_fields = ["model"]                 # dotted paths into the JSON response
+record_headers = []                       # e.g. your gateway's "which backend served this" headers.
+# LiteLLM proxy: ["x-litellm-model-api-base", "x-litellm-model-id", "x-litellm-attempted-fallbacks"]
+
+# ---------------------------------------------------------------------------
+# Your commands to take the local model away and bring it back. bordercheck shows each
+# command and asks before running it. See docs/fault-injection.md.
+# ---------------------------------------------------------------------------
+[fault]
+start = "kubectl -n ai-staging scale deployment/local-llm --replicas=0"
+stop  = "kubectl -n ai-staging scale deployment/local-llm --replicas=1"
+settle_seconds = 30
+
+# ---------------------------------------------------------------------------
+# Probes: failovers that happen with nothing down. Run after the baseline, with the local model
+# healthy. Gateways can send a request to a cloud model because the prompt is too long
+# (LiteLLM: context_window_fallbacks), a rate limit was hit (fallbacks, or a model group that
+# also contains a cloud deployment), or the local model or a guardrail rejected it
+# (content_policy_fallbacks). Leave out any you don't want; they're off unless listed.
+# ---------------------------------------------------------------------------
+[probes.context_window]
+pad_tokens = 40000      # more than the local model's context window (vLLM: --max-model-len)
+requests = 3
+
+[probes.rate_limit]
+requests = 60           # a burst at staging: tell whoever shares the environment
+concurrency = 20        # at most 64
+
+# [probes.content_policy]
+# prompt = "..."        # something your local model or guardrail refuses, with {{canary}} in it
+# requests = 3
+
+# ---------------------------------------------------------------------------
+# Where to look. Every source is read-only from bordercheck's side; give it read-only credentials.
+# layer: data | processing | model_state | logs      location: where that store physically sits
+# type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
+# positive_control = true marks a source that must find the customer for the run to pass.
+# Commands, URLs and paths can use the run's time window: {{run_started}} {{run_ended}} (ISO 8601
+# UTC, widened by clock_skew_seconds), {{run_started_epoch}}, {{run_minutes}} and {{run_id}}.
+# An http URL with {{page}} is fetched page by page (max_pages, default 20).
+# See docs/where-to-look.md for a checklist.
+# ---------------------------------------------------------------------------
+[[sources]]
+name = "Gateway logs"
+type = "command"
+# With -l, kubectl logs every matching pod (deployment/NAME picks just one) but defaults to the
+# last 10 lines per pod, so --tail=-1 matters.
+command = "kubectl -n ai-staging logs -l app=ai-gateway --all-containers --since-time={{run_started}} --tail=-1 --max-log-requests=20"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Application logs"
+type = "path"
+path = "/mnt/log-export/chat-service/"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Tracing / LLM observability"
+type = "http"
+# Langfuse public API. List traces include input, output and metadata. Generations are listed
+# separately; scan both. Limited to the run's window and paged until Langfuse says there's no more.
+url = [
+  "https://tracing.staging.internal/api/public/traces?fromTimestamp={{run_started}}&limit=100&page={{page}}",
+  "https://tracing.staging.internal/api/public/observations?type=GENERATION&fromStartTime={{run_started}}&limit=100&page={{page}}",
+]
+# base64 of "public_key:secret_key". GNU base64 wraps long output, which breaks the header:
+#   export TRACING_BASIC_AUTH=$(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')
+headers = { Authorization = "Basic ${TRACING_BASIC_AUTH}" }
+layer = "logs"
+location = "DE"
+# Positive control: a source you know stores prompts. If it doesn't find the customer, the scan
+# itself is broken and the verdict is inconclusive, never pass. Move this to whichever source you
+# trust most (with seeded mode, the system of record you loaded seed_record.json into).
+positive_control = true
+
+[[sources]]
+name = "Tracing raw event storage"
+type = "command"
+# Copies into a private temp dir, prints every object (decompressing .gz), then deletes the copy.
+# These objects hold real prompts: don't sync them to a fixed, shared path under /tmp.
+# Narrow the prefix (Langfuse writes <prefix><projectId>/<type>/<id>/...) so you aren't pulling the
+# whole bucket. Or sync it yourself and use a `path` source.
+command = "d=$(mktemp -d) && trap 'rm -rf \"$d\"' EXIT && aws s3 sync s3://tracing-events-staging/ \"$d\" --only-show-errors && find \"$d\" -type f -exec gzip -dcf {} +"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Semantic / prompt cache"
+type = "command"
+# Adapt to how your cache stores entries: MGET returns nothing for hashes (use HGETALL) or
+# RedisJSON keys (use JSON.GET). redis-cli reads the password from REDISCLI_AUTH, which keeps it
+# out of the process list (-a doesn't).
+command = "redis-cli -h cache.staging.internal --scan --pattern 'llm:*' | xargs -r -n 50 redis-cli -h cache.staging.internal MGET"
+layer = "model_state"
+location = "DE"
+
+[[sources]]
+name = "Vector store (metadata and chunk text)"
+type = "command"
+# Table and column names depend on your framework. These are LangChain's PGVector defaults; for
+# LlamaIndex it's data_<table>(text, metadata_). concat_ws skips NULLs; `a || b` would turn the
+# whole row NULL and hide a hit. Connection details come from PGHOST/PGUSER/PGDATABASE and
+# ~/.pgpass (or PGSERVICE), so no password appears on the command line.
+command = "psql -At -c \"select concat_ws(' ', cmetadata::text, document) from langchain_pg_embedding\""
+layer = "model_state"
+location = "DE"
+
+# Egress evidence: proxy, firewall, flow or DNS logs. Marked egress = true, these are also
+# searched for the watch_destinations below. With TLS inspection, canary hits show content too.
+[[sources]]
+name = "Egress proxy logs"
+type = "path"
+path = "/mnt/log-export/egress-proxy/"
+layer = "logs"
+location = "DE"
+egress = true
+
+# Public model API hostnames to flag in egress sources. Defaults cover the common providers;
+# set this to replace them, including any regional endpoints you use.
+# watch_destinations = ["api.openai.com", "*.openai.azure.com", "bedrock-runtime.*.amazonaws.com"]
+
+# Allowance for clock differences between this machine and the stores, in the time window.
+# clock_skew_seconds = 120
+
+# One-page HTML summary (summary.html) for people who won't read report.md. With this on, it
+# ends with the regulations this evidence is relevant to (DORA, GDPR Chapter V, EBA outsourcing).
+# [report]
+# regulatory_appendix = true
+
+# Headers are refused over plain http:// except to localhost (an SSH tunnel is fine).
+# allow_plaintext_http = true
