@@ -1,13 +1,15 @@
-"""Command line: new -> send baseline -> fault start -> send fault -> fault stop -> scan -> report.
+"""Command line: new -> send baseline -> probes -> fault start -> send fault -> fault stop -> scan -> report.
 
 `report` and `all` exit 0 for pass, 1 for fail (data crossed the border), 3 for inconclusive
-(no working positive control, or a source had errors), 2 for config errors.
+(no working positive control, or a source had errors), 2 for config errors. `diff` and
+`rescan --expect-gone` exit 1 on a regression; `verify` exits 1 if a bundle doesn't match.
 """
 import argparse
 import json
+import os
 import time
 
-from . import canary, config, fault, report, runs, scan, send
+from . import canary, config, evidence, fault, onepager, report, runs, scan, send
 
 
 def _cfg(args):
@@ -37,6 +39,22 @@ def cmd_send(args):
     runs.save(cfg, run)
 
 
+def cmd_probe(args):
+    cfg = _cfg(args)
+    run = runs.load(cfg, args.run)
+    names = args.only or list(cfg["probes"])
+    for name in names:
+        if name not in cfg["probes"]:
+            raise config.ConfigError(f"no [probes.{name}] section in the config")
+        prompt, n, concurrency = send.probe_settings(cfg, name)
+        phase = f"probe:{name}"
+        print(f"\n[{phase}] {n} request(s), concurrency {concurrency}")
+        runs.event(run, f"{phase} started")
+        send.send_phase(cfg, run, phase, n, prompt=prompt, concurrency=concurrency)
+        runs.event(run, f"{phase} finished")
+        runs.save(cfg, run)
+
+
 def cmd_fault(args):
     cfg = _cfg(args)
     run = runs.load(cfg, args.run)
@@ -60,10 +78,32 @@ def cmd_scan(args):
     if wait:
         print(f"waiting {wait:.0f}s for logs and traces to flush")
         time.sleep(wait)
-    results = scan.scan_sources(cfg, canary.needles(run["record"], run["run_id"]))
+    skew = float(cfg.get("clock_skew_seconds", 120))
+    results = scan.scan_sources(cfg, canary.needles(run["record"], run["run_id"]), scan.window(run, skew=skew))
     runs.write(cfg, args.run, "scan.json", json.dumps(results, indent=2))
+    run["scanned_at"] = time.time()
     runs.event(run, "scan finished")
     runs.save(cfg, run)
+
+
+def cmd_rescan(args):
+    """Scan again later, over the original run window, to see which copies have expired."""
+    cfg = _cfg(args)
+    run = runs.load(cfg, args.run)
+    if "scanned_at" not in run:
+        raise config.ConfigError(f"run {args.run} hasn't been scanned yet; run `scan` first")
+    path = runs.run_dir(cfg, args.run)
+    with open(os.path.join(path, "scan.json")) as f:
+        first = json.load(f)
+    skew = float(cfg.get("clock_skew_seconds", 120))
+    later = scan.scan_sources(cfg, canary.needles(run["record"], run["run_id"]),
+                              scan.window(run, end=run["scanned_at"], skew=skew))
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    runs.write(cfg, args.run, f"rescan-{stamp}.json", json.dumps(later, indent=2))
+    text, still = evidence.retention(first, later, canary.IDENTIFIER_KINDS, run["scanned_at"], run["run_id"])
+    runs.write(cfg, args.run, f"retention-{stamp}.md", text)
+    print(text)
+    return 1 if args.expect_gone and still else 0
 
 
 def cmd_report(args):
@@ -72,11 +112,52 @@ def cmd_report(args):
     with open(f"{runs.run_dir(cfg, args.run)}/scan.json") as f:
         results = json.load(f)
     text, summary = report.build(cfg, run, results, redact=args.redact)
+    path = runs.run_dir(cfg, args.run)
     runs.write(cfg, args.run, "report.md", text)
     runs.write(cfg, args.run, "summary.json", json.dumps(summary, indent=2))
-    print(f"report: {runs.run_dir(cfg, args.run)}/report.md")
+    appendix = bool((cfg.get("report") or {}).get("regulatory_appendix"))
+    runs.write(cfg, args.run, "summary.html", onepager.html(summary, frameworks=appendix))
+    runs.write(cfg, args.run, evidence.MANIFEST, json.dumps(
+        evidence.manifest(path, args.config, args.run, summary["verdict"]), indent=2))
+    print(f"report: {path}/report.md  (one-pager: summary.html)")
     print(f"verdict: {summary['verdict'].upper()}" + "".join(f"\n  - {r}" for r in summary["reasons"]))
     return report.EXIT_CODES[summary["verdict"]]
+
+
+def cmd_evidence(args):
+    cfg = _cfg(args)
+    path = runs.run_dir(cfg, args.run)
+    if not os.path.exists(os.path.join(path, "summary.json")):
+        raise config.ConfigError(f"run {args.run} has no report yet; run `report` first")
+    with open(os.path.join(path, "summary.json")) as f:
+        verdict = json.load(f)["verdict"]
+    # Refresh the manifest so it covers files written since the report (diffs, rescans).
+    runs.write(cfg, args.run, evidence.MANIFEST,
+               json.dumps(evidence.manifest(path, args.config, args.run, verdict), indent=2))
+    out = os.path.join(cfg["output_dir"], f"{args.run}-evidence.zip")
+    digest = evidence.bundle(path, out, include_config=args.config if args.include_config else None)
+    print(f"evidence bundle: {out}\nsha256: {digest}\n"
+          "Record this hash in your change or audit ticket, or sign the file, so it can't be swapped later.")
+
+
+def cmd_verify(args):
+    problems = evidence.verify(args.bundle)
+    for p in problems:
+        print(f"  {p}")
+    print("bundle matches its manifest" if not problems else "bundle does NOT match its manifest")
+    return 1 if problems else 0
+
+
+def cmd_diff(args):
+    cfg = _cfg(args)
+    docs = []
+    for run_id in (args.against, args.run):
+        with open(os.path.join(runs.run_dir(cfg, run_id), "summary.json")) as f:
+            docs.append(json.load(f))
+    text, regressed = evidence.diff(*docs)
+    runs.write(cfg, args.run, f"diff-vs-{args.against}.md", text)
+    print(text)
+    return 1 if regressed else 0
 
 
 def cmd_all(args):
@@ -87,6 +168,9 @@ def cmd_all(args):
         cfg = _cfg(args)
         print(f"\n== dry run ==\nwould send {cfg['requests_per_phase']} baseline and "
               f"{cfg['requests_per_phase']} fault request(s) to {cfg['target']['url']}")
+        for name in cfg["probes"]:
+            _prompt, n, concurrency = send.probe_settings(cfg, name)
+            print(f"would run probe {name}: {n} request(s), concurrency {concurrency}")
         for action in ("start", "stop"):
             command = (cfg.get("fault") or {}).get(action)
             if command:
@@ -100,8 +184,13 @@ def cmd_all(args):
     print("\n== baseline ==")
     args.phase = "baseline"
     cmd_send(args)
-    print("\n== fault ==")
     cfg = _cfg(args)
+    if cfg["probes"]:
+        # With the local model healthy: failovers that happen with nothing down.
+        print("\n== probes ==")
+        args.only = None
+        cmd_probe(args)
+    print("\n== fault ==")
     if not (cfg.get("fault") or {}).get("start"):
         print("no [fault] start command configured; skipping the fault phase")
     else:
@@ -137,6 +226,11 @@ def main(argv=None):
     s.add_argument("-n", type=int, help="number of requests (default from config)")
     s.set_defaults(fn=cmd_send)
 
+    pr = sub.add_parser("probe", help="run the [probes] that trigger failover with nothing down")
+    pr.add_argument("--run", required=True)
+    pr.add_argument("--only", action="append", choices=config.PROBES, help="run just this probe (repeatable)")
+    pr.set_defaults(fn=cmd_probe)
+
     f = sub.add_parser("fault", help="run your configured start/stop command")
     f.add_argument("action", choices=["start", "stop"])
     f.add_argument("--run", required=True)
@@ -154,7 +248,26 @@ def main(argv=None):
                    help="leave out file paths, URLs and fault commands, for sharing outside the team")
     r.set_defaults(fn=cmd_report)
 
-    a = sub.add_parser("all", help="new, baseline, fault, scan and report in one go")
+    rs = sub.add_parser("rescan", help="scan again later, to see which copies have expired")
+    rs.add_argument("--run", required=True)
+    rs.add_argument("--expect-gone", action="store_true", help="exit 1 if any store still holds the customer")
+    rs.set_defaults(fn=cmd_rescan)
+
+    d = sub.add_parser("diff", help="compare a run with an earlier one; exit 1 on a regression")
+    d.add_argument("--run", required=True, help="the newer run")
+    d.add_argument("--against", required=True, help="the earlier run")
+    d.set_defaults(fn=cmd_diff)
+
+    ev = sub.add_parser("evidence", help="bundle a run and its manifest into a zip for an auditor")
+    ev.add_argument("--run", required=True)
+    ev.add_argument("--include-config", action="store_true", help="add the config file (it holds no secrets)")
+    ev.set_defaults(fn=cmd_evidence)
+
+    v = sub.add_parser("verify", help="check an evidence bundle against its manifest")
+    v.add_argument("bundle")
+    v.set_defaults(fn=cmd_verify)
+
+    a = sub.add_parser("all", help="new, baseline, probes, fault, scan and report in one go")
     a.add_argument("--dry-run", action="store_true", help="show fault commands without running them")
     a.add_argument("--yes", action="store_true", help="don't ask before running fault commands")
     a.add_argument("--redact", action="store_true", help="write a shareable report (see `report --redact`)")

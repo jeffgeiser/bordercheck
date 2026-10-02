@@ -31,7 +31,7 @@ headers = { Authorization = "Bearer ${LITELLM_KEY}" }
 timeout_seconds = 120            # above LiteLLM's own timeout, so a hung model fails over before we give up
 pause_seconds = 0.5
 
-prompt = "Customer {{name}} (ref {{canary}}, account {{account}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
+prompt = "Customer {{name}} (ref {{canary}}, account {{account}}, IBAN {{iban}}, email {{email}}, phone {{phone}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
 
 # `user` becomes the Langfuse trace's user id and LiteLLM's end_user, so the coverage check sees
 # request ids without the identifiers. metadata.tags lets the Langfuse query below find the traces.
@@ -46,6 +46,20 @@ record_headers = ["x-litellm-model-api-base", "x-litellm-model-id", "x-litellm-a
 start = "docker stop CHANGE-ME-model-container"
 stop  = "docker start CHANGE-ME-model-container"
 settle_seconds = 30
+
+# Failovers with nothing down. LiteLLM sends a too-long prompt to context_window_fallbacks, a
+# rate-limited one to fallbacks (or to any cloud deployment in the same model group), and a
+# rejected one to content_policy_fallbacks. Check your router settings for which apply.
+[probes.context_window]
+pad_tokens = 40000      # above the local model's --max-model-len
+requests = 3
+
+[probes.rate_limit]
+requests = 60
+concurrency = 20
+
+[report]
+regulatory_appendix = true
 
 # ---------------------------------------------------------------------------
 # Logs and control plane
@@ -73,25 +87,25 @@ location = "DE"
 [[sources]]
 name = "LiteLLM spend logs (Postgres)"
 type = "command"
-command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_id, \\"user\\", end_user, messages::text, response::text, proxy_server_request::text, metadata::text) from \\"LiteLLM_SpendLogs\\" where \\"startTime\\" > now() - interval '3 hours'" """
+command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_id, \\"user\\", end_user, messages::text, response::text, proxy_server_request::text, metadata::text) from \\"LiteLLM_SpendLogs\\" where \\"startTime\\" > '{{run_started}}'" """
 layer = "logs"
 location = "DE"
 
 [[sources]]
 name = "LiteLLM error logs (Postgres)"
 type = "command"
-command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_kwargs::text, exception_string) from \\"LiteLLM_ErrorLogs\\" where \\"startTime\\" > now() - interval '3 hours'" """
+command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_kwargs::text, exception_string) from \\"LiteLLM_ErrorLogs\\" where \\"startTime\\" > '{{run_started}}'" """
 layer = "logs"
 location = "DE"
 
-# Langfuse's query API (served from ClickHouse). Use a project key with read access.
+# Langfuse's query API (served from ClickHouse). Use a project key with read access. Limited to
+# the run's window and paged until Langfuse reports the last page.
 [[sources]]
 name = "Langfuse traces and generations"
 type = "http"
 url = [
-  "http://localhost:3000/api/public/traces?tags=canarykit&limit=100",
-  "http://localhost:3000/api/public/observations?type=GENERATION&limit=100",
-  "http://localhost:3000/api/public/observations?type=GENERATION&limit=100&page=2",
+  "http://localhost:3000/api/public/traces?tags=canarykit&fromTimestamp={{run_started}}&limit=100&page={{page}}",
+  "http://localhost:3000/api/public/observations?type=GENERATION&fromStartTime={{run_started}}&limit=100&page={{page}}",
 ]
 headers = { Authorization = "Basic ${LANGFUSE_AUTH}" }
 layer = "logs"

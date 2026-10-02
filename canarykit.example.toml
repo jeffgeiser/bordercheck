@@ -27,9 +27,11 @@ headers = { Authorization = "Bearer ${GATEWAY_TOKEN}" }
 timeout_seconds = 60
 # ca_file = "/etc/ssl/certs/internal-ca.pem"
 
-# Placeholders: {{name}} {{role}} {{city}} {{product}} {{amount}} {{canary}} {{account}} {{request_id}} {{run_id}}
+# Placeholders: {{name}} {{role}} {{city}} {{product}} {{amount}} {{canary}} {{account}} {{email}}
+# {{phone}} {{iban}} {{request_id}} {{run_id}}. Email, phone and IBAN are in real formats from
+# reserved ranges, so the report shows which formats your redaction catches.
 # Direct mode: identifiers are in the prompt.
-prompt = "Customer {{name}} (ref {{canary}}, account {{account}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
+prompt = "Customer {{name}} (ref {{canary}}, account {{account}}, IBAN {{iban}}, email {{email}}, phone {{phone}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
 # Seeded mode: load runs/<run>/seed_record.json into your test data first, then ask by name only:
 # prompt = "Summarize the open {{product}} for customer {{name}}."
 
@@ -53,10 +55,32 @@ stop  = "kubectl -n ai-staging scale deployment/local-llm --replicas=1"
 settle_seconds = 30
 
 # ---------------------------------------------------------------------------
+# Probes: failovers that happen with nothing down. Run after the baseline, with the local model
+# healthy. Gateways can send a request to a cloud model because the prompt is too long
+# (LiteLLM: context_window_fallbacks), a rate limit was hit (fallbacks, or a model group that
+# also contains a cloud deployment), or the local model or a guardrail rejected it
+# (content_policy_fallbacks). Leave out any you don't want; they're off unless listed.
+# ---------------------------------------------------------------------------
+[probes.context_window]
+pad_tokens = 40000      # more than the local model's context window (vLLM: --max-model-len)
+requests = 3
+
+[probes.rate_limit]
+requests = 60           # a burst at staging: tell whoever shares the environment
+concurrency = 20        # at most 64
+
+# [probes.content_policy]
+# prompt = "..."        # something your local model or guardrail refuses, with {{canary}} in it
+# requests = 3
+
+# ---------------------------------------------------------------------------
 # Where to look. Every source is read-only from canarykit's side; give it read-only credentials.
 # layer: data | processing | model_state | logs      location: where that store physically sits
 # type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
 # positive_control = true marks a source that must find the customer for the run to pass.
+# Commands, URLs and paths can use the run's time window: {{run_started}} {{run_ended}} (ISO 8601
+# UTC, widened by clock_skew_seconds), {{run_started_epoch}}, {{run_minutes}} and {{run_id}}.
+# An http URL with {{page}} is fetched page by page (max_pages, default 20).
 # See docs/where-to-look.md for a checklist.
 # ---------------------------------------------------------------------------
 [[sources]]
@@ -64,7 +88,7 @@ name = "Gateway logs"
 type = "command"
 # With -l, kubectl logs every matching pod (deployment/NAME picks just one) but defaults to the
 # last 10 lines per pod, so --tail=-1 matters.
-command = "kubectl -n ai-staging logs -l app=ai-gateway --all-containers --since=2h --tail=-1 --max-log-requests=20"
+command = "kubectl -n ai-staging logs -l app=ai-gateway --all-containers --since-time={{run_started}} --tail=-1 --max-log-requests=20"
 layer = "logs"
 location = "DE"
 
@@ -79,10 +103,10 @@ location = "DE"
 name = "Tracing / LLM observability"
 type = "http"
 # Langfuse public API. List traces include input, output and metadata. Generations are listed
-# separately; scan both. limit is per page, so add page=2 URLs for a busy project.
+# separately; scan both. Limited to the run's window and paged until Langfuse says there's no more.
 url = [
-  "https://tracing.staging.internal/api/public/traces?limit=100",
-  "https://tracing.staging.internal/api/public/observations?type=GENERATION&limit=100",
+  "https://tracing.staging.internal/api/public/traces?fromTimestamp={{run_started}}&limit=100&page={{page}}",
+  "https://tracing.staging.internal/api/public/observations?type=GENERATION&fromStartTime={{run_started}}&limit=100&page={{page}}",
 ]
 # base64 of "public_key:secret_key". GNU base64 wraps long output, which breaks the header:
 #   export TRACING_BASIC_AUTH=$(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')
@@ -139,6 +163,14 @@ egress = true
 # Public model API hostnames to flag in egress sources. Defaults cover the common providers;
 # set this to replace them, including any regional endpoints you use.
 # watch_destinations = ["api.openai.com", "*.openai.azure.com", "bedrock-runtime.*.amazonaws.com"]
+
+# Allowance for clock differences between this machine and the stores, in the time window.
+# clock_skew_seconds = 120
+
+# One-page HTML summary (summary.html) for people who won't read report.md. With this on, it
+# ends with the regulations this evidence is relevant to (DORA, GDPR Chapter V, EBA outsourcing).
+# [report]
+# regulatory_appendix = true
 
 # Headers are refused over plain http:// except to localhost (an SSH tunnel is fine).
 # allow_plaintext_http = true

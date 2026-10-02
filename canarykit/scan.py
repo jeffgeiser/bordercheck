@@ -2,22 +2,50 @@
 
 Hits record where (source, file, line or byte offset) and which pattern matched. The matching
 content itself is never copied into the results.
+
+Source commands, URLs and paths can use the run's time window, so a scan covers exactly the run
+rather than "the last two hours": {{run_started}} and {{run_ended}} (ISO 8601 UTC, widened by
+clock_skew_seconds), {{run_started_epoch}}, {{run_minutes}} (whole minutes since the run started,
+for flags like --since=...m) and {{run_id}}. An http URL with {{page}} is fetched page by page.
 """
 import gzip
+import json
+import math
 import os
 import re
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 
 from . import net
+from .canary import IDENTIFIER_KINDS
 from .config import expand_env, require_env
+from .send import render
 
 CHUNK = 1 << 20
 OVERLAP = 512
 MAX_HITS_PER_PATTERN = 50
+MAX_PAGE_BYTES = 64 << 20
+
+
+def _iso(t):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+
+def window(run, end=None, skew=120):
+    """Placeholder values for the run's time window. Values are digits, letters, ':' and '-' only,
+    so they're safe to put in a shell command."""
+    start = run["created"] - skew
+    end = (end or time.time()) + skew
+    return {
+        "run_id": run["run_id"],
+        "run_started": _iso(start), "run_ended": _iso(end),
+        "run_started_epoch": str(int(start)),
+        "run_minutes": str(math.ceil((time.time() - start) / 60)),
+    }
 
 
 def _watch_regex(pattern):
@@ -122,15 +150,44 @@ def _http_chunks(url, headers, ca_file, timeout):
         raise SourceError(f"HTTP {e.code}" + (" (redirects are not followed)" if 300 <= e.code < 400 else ""))
 
 
-def _iter_targets(src):
+def _last_page(body, page):
+    """True when a paged JSON response says there's nothing after `page` (Langfuse's meta.totalPages,
+    or an empty `data` list). Anything that isn't JSON is treated as a single page."""
+    try:
+        doc = json.loads(body)
+    except ValueError:
+        return True
+    if not isinstance(doc, dict):
+        return True
+    total = (doc.get("meta") or {}).get("totalPages") if isinstance(doc.get("meta"), dict) else None
+    data = doc.get("data")
+    return (isinstance(total, int) and page >= total) or (isinstance(data, list) and not data)
+
+
+def _http_pages(url, headers, ca_file, timeout, max_pages):
+    for page in range(1, max_pages + 1):
+        req = urllib.request.Request(expand_env(url.replace("{{page}}", str(page))), headers=headers)
+        try:
+            with net.opener(req.full_url, ca_file).open(req, timeout=timeout) as resp:
+                body, truncated = net.read_capped(resp, MAX_PAGE_BYTES)
+        except urllib.error.HTTPError as e:
+            raise SourceError(f"page {page}: HTTP {e.code}")
+        yield page, body
+        if truncated or _last_page(body, page):
+            return
+    print(f"\n    stopped at max_pages = {max_pages}; there may be more", end="")
+
+
+def _iter_targets(src, values=None):
     """Yield (where, chunk iterator) pairs for one configured source.
 
     `where` comes from the config as written (before ${VAR} expansion), so it never holds secrets.
     """
+    values = values or {}
     kind = src["type"]
     if kind == "path":
         for root in [src["path"]] if isinstance(src["path"], str) else src["path"]:
-            root = os.path.expanduser(root)
+            root = os.path.expanduser(render(root, values))
             if not os.path.exists(root):
                 raise SourceError(f"{root} does not exist")
             if os.path.isfile(root):
@@ -141,13 +198,19 @@ def _iter_targets(src):
                     full = os.path.join(dirpath, name)
                     yield full, _file_chunks(full)
     elif kind == "command":
-        command = require_env(src["command"])
+        command = require_env(render(src["command"], values))
         yield "command output", _command_chunks(command, float(src.get("timeout_seconds", 300)))
     elif kind == "http":
         urls = [src["url"]] if isinstance(src["url"], str) else src["url"]
         headers = expand_env(dict(src.get("headers", {})))
+        timeout = float(src.get("timeout_seconds", 60))
         for url in urls:
-            yield url, _http_chunks(url, headers, src.get("ca_file"), float(src.get("timeout_seconds", 60)))
+            url = render(url, values)
+            if "{{page}}" in url:
+                for page, body in _http_pages(url, headers, src.get("ca_file"), timeout, int(src.get("max_pages", 20))):
+                    yield url.replace("{{page}}", str(page)), iter([body])
+            else:
+                yield url, _http_chunks(url, headers, src.get("ca_file"), timeout)
 
 
 def _safe_error(e):
@@ -171,7 +234,7 @@ def _guard(chunks, failures):
         failures.append(_safe_error(e))
 
 
-def scan_sources(cfg, needles):
+def scan_sources(cfg, needles, values=None):
     watch = [(p, _watch_regex(p)) for p in cfg["watch_destinations"]]
     results = []
     for src in cfg.get("sources", []):
@@ -181,7 +244,7 @@ def scan_sources(cfg, needles):
         entry.update(hits=[], targets_scanned=0, errors=[], truncated=[])
         print(f"  scanning {src['name']} ...", end="", flush=True)
         try:
-            for where, chunks in _iter_targets(src):
+            for where, chunks in _iter_targets(src, values):
                 failures = []
                 hits, truncated = scan_stream(_guard(chunks, failures), needles, watch if src.get("egress") else [])
                 if failures:
@@ -194,7 +257,7 @@ def scan_sources(cfg, needles):
                 entry["truncated"].extend(f"{where}: {t}" for t in truncated)
         except Exception as e:
             entry["errors"].append(_safe_error(e))
-        n = sum(1 for h in entry["hits"] if h["kind"] in ("canary", "account"))
+        n = sum(1 for h in entry["hits"] if h["kind"] in IDENTIFIER_KINDS)
         print(f" {entry['targets_scanned']} target(s), {n} canary/account hit(s)"
               f"{', ERRORS' if entry['errors'] else ''}")
         results.append(entry)

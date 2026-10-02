@@ -1,6 +1,6 @@
 # canarykit
 
-A test harness for data residency in self-hosted AI stacks. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), takes the in-country model away so the gateway's failover runs, then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on.
+A test harness for data residency in self-hosted AI stacks. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), triggers the gateway's fallbacks (with the in-country model taken away, and with it healthy but given a prompt too long for it or a burst of requests), then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on, a one-page summary for non-engineers, and an evidence bundle you can hand to an auditor.
 
 Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. canarykit tests behavior instead. In our lab, with the model in Frankfurt, the customer's data still turned up in stores nobody had listed, and in a public API in the US once the local model failed over. No request returned an error.
 
@@ -9,18 +9,28 @@ Standard-library Python 3.11+, no dependencies, read-only against everything it 
 ## How it works
 
 ```
- new ──> send baseline ──> fault start ──> send fault ──> fault stop ──> scan ──> report
-  │          │                  │               │                         │         │
-  │          └─ records who answered each request (status, timing,        │         └─ verdict + exit code
-  │             served-by headers/fields); bodies are never stored        │
-  │                                             your own commands,        └─ read-only search of
-  └─ synthetic customer: CNRY-XXXX-XXXX          shown and confirmed         every source you list
-     canary + 14-digit account number            before they run
+ new ──> baseline ──> probes ──> fault start ──> fault ──> fault stop ──> scan ──> report
+  │         │           │             │                                  │          │
+  │         │           │             └─ your own commands, shown and    │          ├─ report.md, summary.json
+  │         │           │                confirmed before they run       │          ├─ summary.html (one page)
+  │         │           └─ model healthy: a prompt longer than its       │          └─ manifest.json (SHA-256)
+  │         │              context, a burst past its rate limit          │
+  │         └─ records who answered each request (status, timing,        └─ read-only search of every
+  │            served-by headers); bodies are never stored                  source, over the run's window
+  └─ synthetic customer: canary, account number, email, phone, IBAN
 ```
 
-**What it searches for.** The canary exactly and lowercased, its base64 encoding at all three byte alignments (so it's found inside base64-encoded JSON, as tracing exporters and queues often store it), the account number plain and space-grouped, and the harness's own request ids. Request ids go somewhere your stack logs them but away from the identifiers (the OpenAI `user` field works well), which is how the report tells "this store saw the request but redacted the customer" from "this store isn't on the request path."
+Later: `rescan` (has it expired?), `diff` (what changed since last time?), `evidence` and `verify` (a hashed bundle for an auditor).
+
+**The synthetic customer.** A canary (`CNRY-XXXX-XXXX`) and a 14-digit account number that exist nowhere else, plus an email, phone number and IBAN in real formats, so the report shows which formats your redaction catches. Each is reserved or impossible: the email is at `example.com` (RFC 2606), the phone number is in Frankfurt's 069 90009 range, which the Bundesnetzagentur keeps unassigned, and the IBAN has a valid checksum but a bank code starting with 9, which no German bank code does.
+
+**What it searches for.** The canary exactly and lowercased, its base64 encoding at all three byte alignments (so it's found inside base64-encoded JSON, as tracing exporters and queues often store it), the account number plain and space-grouped, the email plain and URL-encoded, the phone in international and national forms, the IBAN compact and grouped, and the harness's own request ids. Request ids go somewhere your stack logs them but away from the identifiers (the OpenAI `user` field works well), which is how the report tells "this store saw the request but redacted the customer" from "this store isn't on the request path."
 
 **What it records.** For each hit: source, file or URL, line and byte offset, and which pattern matched. Never the matching content.
+
+**Failover with nothing down.** An outage isn't the only way a gateway reaches for a cloud model. LiteLLM, for example, has `context_window_fallbacks` for prompts the local model can't take, `fallbacks` on rate limits, and `content_policy_fallbacks` when a model or guardrail refuses. The `[probes]` section sends a prompt padded past the local context window, a concurrent burst, and optionally a prompt your guardrail rejects, all with the local model healthy. If the gateway's own response headers (such as `x-litellm-model-api-base`) name a public API, that phase fails.
+
+**Scanning the run, not "the last two hours".** Source commands and URLs can use `{{run_started}}`, `{{run_ended}}`, `{{run_minutes}}` and `{{run_id}}`, so `kubectl logs --since-time={{run_started}}` or Langfuse's `fromTimestamp={{run_started}}` cover exactly the run. An http URL with `{{page}}` is fetched page by page until the API reports the last page, so a busy tracing project can't push the run's traces off the first page and make them look clean.
 
 **The four residency layers.** Every source is tagged with one, and a layer with no sources is reported as **not checked**, never as clean:
 
@@ -36,12 +46,24 @@ Standard-library Python 3.11+, no dependencies, read-only against everything it 
 | Verdict | Exit | Meaning |
 |---|---|---|
 | **pass** | 0 | No identifiers in sources outside the border, no egress to public model APIs the border doesn't allow, a positive control found the customer, and no source had errors |
-| **fail** | 1 | Identifiers were found outside the border, or egress logs show traffic to a disallowed model API. A found leak stands regardless of anything else |
-| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, or a different backend answered during the fault with no egress source to show where it runs |
+| **fail** | 1 | Identifiers were found outside the border, egress logs show traffic to a disallowed model API, or the gateway's served-by fields say a disallowed public API answered (in the fault or any probe). A found leak stands regardless of anything else |
+| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, or a different backend answered (in the fault or a probe) that neither the served-by fields nor an egress source can place |
 
 Config errors exit 2. The reasons are listed at the top of `report.md` and in `summary.json`.
 
 **Positive control.** Mark one source you know stores prompts with `positive_control = true` (with seeded mode, the system of record you loaded the customer into). If it doesn't find the customer, the scan itself is broken: a wrong time window, a missing permission, a log shipper that hasn't flushed. A clean result without a working positive control can't be told apart from a broken scan, so it's never a pass.
+
+## Evidence, retention and drift
+
+| Command | What it gives you |
+|---|---|
+| `report` | Also writes `summary.html`, a one-page summary (verdict, a grid of the four layers, who answered under each condition, which identifier formats each store kept). Self-contained, no scripts, prints to one PDF page. `[report] regulatory_appendix = true` adds the regulations the evidence is relevant to (DORA Art. 28/30, GDPR Chapter V, EBA outsourcing guidelines, AI Act Art. 12) |
+| `evidence --run <id>` | A zip of the run folder with `manifest.json`: SHA-256 of every file, the canarykit and Python versions, and the config's hash. Prints the zip's own hash to record in a change or audit ticket, or sign |
+| `verify <zip>` | Rechecks every file in a bundle against its manifest. Exit 1 on any mismatch |
+| `diff --run <new> --against <old>` | What changed: verdict, places holding the customer, egress destinations, who answered, and stores that now keep an identifier format they used to mask. Exit 1 on a regression, so a scheduled run can alert |
+| `rescan --run <id>` | Scans again, days later, over the original run's window, and shows which stores still hold the customer. `--expect-gone` exits 1 if any do: a direct test of your retention settings |
+
+A manifest makes changes detectable, not impossible: anyone who can rewrite the files can rewrite the manifest. Signing the bundle (`cosign sign-blob`, `gpg --detach-sign`) or storing its hash where they can't edit it is what makes it binding.
 
 ## Quick start
 
@@ -66,6 +88,7 @@ If you'd rather control each step, or can't let a script touch your deployment, 
 ```bash
 python -m canarykit new                                  # prints the run id and the canary
 python -m canarykit send  --run <id> --phase baseline
+python -m canarykit probe --run <id>                     # optional: the [probes] you configured
 # ...take the local model down however your team does it...
 python -m canarykit send  --run <id> --phase fault
 # ...bring it back...
@@ -96,6 +119,7 @@ canarykit only knows what you point it at. A clean result means *clean in the so
 - **Egress without TLS inspection** shows where requests went (proxy, flow and DNS logs), not what they carried. With inspection, canary hits in egress logs show the content left too.
 - **The fallback provider's side** is invisible: their retention, monitoring logs and backups. The harness can show your data reached them, and their data-processing terms tell you the rest.
 - **Embeddings**: finding no canary in a vector store doesn't mean the vectors carry no personal data.
+- **Load**: the rate-limit probe sends a concurrent burst. Tell whoever shares the staging environment, or leave `[probes.rate_limit]` out.
 - **Timing**: it's one run of one configuration. A hung or overloaded model usually fails over after a timeout rather than instantly. Test that too (see `docs/fault-injection.md`).
 
 This is an engineering test that produces evidence. It isn't a compliance assessment or legal advice.
@@ -111,7 +135,7 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 | `docs/where-to-look.md` | Checklist of stores that tend to keep copies |
 | `docs/sample-report.md` | What a report looks like, from a mock stack that fails over to a public API |
 | `SECURITY.md` | What canarykit runs, reads, sends and stores, and how secrets are handled |
-| `canarykit/` | About 1,100 lines of standard-library Python |
+| `canarykit/` | About 1,800 lines of standard-library Python |
 | `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
 
 ## Design choices you can check

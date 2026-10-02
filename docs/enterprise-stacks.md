@@ -20,6 +20,11 @@ apps / agents ──> AI gateway ──> in-country model (vLLM, NVIDIA NIM, TGI
 | Question | What answers it in canarykit |
 |---|---|
 | Does any request leave the border when the local model fails? | `[fault]` plus `record_headers` (who answered) plus an `egress = true` source (where traffic went) |
+| Does any request leave the border with nothing down? | `[probes]`: a prompt past the local context window, a burst past the rate limit, a prompt a guardrail refuses |
+| Does redaction catch real identifier formats? | The "which identifier formats each store kept" table: email, phone and IBAN next to the canary |
+| Do copies expire as the retention policy says? | `rescan --run <id> --expect-gone`, days later |
+| Has anything changed since the last approved run? | `diff --run <new> --against <old>`, exit 1 on a regression |
+| What do we hand the auditor? | `evidence --run <id>`: the run, a SHA-256 manifest and the config hash, in one zip; `verify` rechecks it |
 | Is a cloud fallback inside the border? | `[border] allowed_destinations` (see below), checked against egress evidence |
 | Which stores keep a copy of the customer's data? | One source per store; the report lists every hit by residency layer |
 | Is redaction actually working? | The coverage check: a store that saw the request ids but not the identifiers |
@@ -46,6 +51,8 @@ The hostname shows where the request was sent. It doesn't always show where it w
 
 **LiteLLM proxy.** Every response carries `x-litellm-model-api-base` (the backend that answered), `x-litellm-model-id` and `x-litellm-attempted-fallbacks`; put them in `record_headers`. LiteLLM also keeps its own copies in Postgres: `LiteLLM_SpendLogs` (`messages`, `response`, `proxy_server_request`, when `store_prompts_in_spend_logs` is on) and `LiteLLM_ErrorLogs` (`request_kwargs` of every failed call, which is where the local model's failed attempts land during the fault). The example config has queries for both. `litellm_settings.turn_off_message_logging` hides prompts from logging callbacks such as Langfuse; the coverage check shows whether it worked.
 
+LiteLLM's fallbacks aren't only for outages. `context_window_fallbacks` catches prompts too long for the local model, `fallbacks` catches rate-limit errors, `content_policy_fallbacks` catches refusals, and a model group that contains both a local and a cloud deployment is load-balanced across them with no error at all. The `[probes]` section exercises the first three; for the fourth, compare the baseline's served-by column across a few runs.
+
 **Other gateways** (Kong AI Gateway, Azure API Management, Apigee, Portkey, cloud-provider gateways): look for a response header or body field that names the backend, and for request or body logging in their diagnostic settings, which usually ships to a log platform covered below.
 
 ## Kubernetes
@@ -69,6 +76,20 @@ location = "DE"
 ```
 
 Fault commands for Kubernetes are in `fault-injection.md`. If an HPA or operator manages the model deployment, scaling to zero may be undone within seconds; pause the operator or use a NetworkPolicy instead.
+
+## Scheduled runs
+
+Running canarykit on a schedule against staging turns a one-off test into a control:
+
+```bash
+python -m canarykit all --yes --redact; rc=$?
+latest=$(basename "$(ls -d runs/run-*/ | tail -1)")
+python -m canarykit diff --run "$latest" --against "$APPROVED_RUN" || echo "residency regression" >&2   # or page someone
+python -m canarykit evidence --run "$latest"
+exit $rc
+```
+
+`--yes` skips confirmation before fault commands, so use it only where those commands are reviewed like code. A week or a month later, `rescan --expect-gone` on the same run checks that copies expired.
 
 ## Log platforms and SIEM
 

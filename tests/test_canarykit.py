@@ -13,7 +13,7 @@ from canarykit import canary, cli, config, report, runs, scan, send
 
 @contextlib.contextmanager
 def serve(handler):
-    srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     try:
         yield f"http://127.0.0.1:{srv.server_port}"
@@ -309,7 +309,7 @@ egress = true
             with open(os.path.join(run_path, "report.md")) as f:
                 text = f.read()
             self.assertEqual([p["name"] for p in summary["places"]], ["App logs"])
-            self.assertEqual(summary["egress_destinations"], {"Egress proxy": ["api.openai.com"]})
+            self.assertEqual(summary["egress_destinations"], {"Egress proxy": {"api.openai.com": 2}})
             self.assertEqual(summary["phases"]["fault"]["answered"], 2)
             self.assertEqual(summary["verdict"], "fail")
             self.assertIn("## Verdict: FAIL", text)

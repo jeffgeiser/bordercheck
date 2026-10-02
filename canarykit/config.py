@@ -8,6 +8,7 @@ ENV_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 PRODUCTION_NAMES = {"prod", "production", "live", "prd"}
 LAYERS = ("data", "processing", "model_state", "logs")
 SOURCE_TYPES = ("path", "command", "http")
+PROBES = ("context_window", "rate_limit", "content_policy")
 
 
 class ConfigError(Exception):
@@ -88,6 +89,16 @@ def load(path, allow_production=False):
     if _plaintext_with_credentials(target["url"], target.get("headers")) and not cfg.get("allow_plaintext_http"):
         raise ConfigError("[target] headers would be sent over plain http. Use https, an SSH tunnel to "
                           "localhost, or set allow_plaintext_http = true")
+
+    probes = cfg.get("probes") or {}
+    for name, probe in probes.items():
+        if name not in PROBES:
+            raise ConfigError(f"[probes.{name}]: unknown probe. Use context_window, rate_limit or content_policy")
+        if name == "content_policy" and not probe.get("prompt"):
+            raise ConfigError("[probes.content_policy] needs a `prompt` your local model or guardrail rejects")
+        if not 1 <= int(probe.get("concurrency", 1)) <= 64:
+            raise ConfigError(f"[probes.{name}] concurrency must be between 1 and 64")
+    cfg["probes"] = probes
 
     cfg.setdefault("output_dir", "runs")
     cfg.setdefault("requests_per_phase", 20)

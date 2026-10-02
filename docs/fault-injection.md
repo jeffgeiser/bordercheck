@@ -47,6 +47,16 @@ start = "kubectl -n ai-staging apply -f deny-local-llm.yaml"
 stop  = "kubectl -n ai-staging delete -f deny-local-llm.yaml"
 ```
 
+## 4. Nothing down: the gateway's other fallbacks
+
+Gateways also fail over when the local model is fine. These don't need a fault command; configure them under `[probes]` and they run after the baseline:
+
+- **Context window**: `[probes.context_window]` pads the prompt past `pad_tokens`. Set it above the local model's limit (vLLM's `--max-model-len`). LiteLLM routes these to `context_window_fallbacks`.
+- **Rate limit**: `[probes.rate_limit]` sends `requests` with `concurrency` in flight. LiteLLM falls back on rate-limit errors through `fallbacks`, and its router will also spread load onto any cloud deployment that shares the local model's model group.
+- **Content policy**: `[probes.content_policy]` sends a prompt you supply that your local model or guardrail refuses. LiteLLM routes those to `content_policy_fallbacks`.
+
+A probe that ends in errors failed closed. One that's answered by a public API is a fail, with the phase named in the verdict.
+
 ## Rules of thumb
 
 - Run `python -m canarykit all --dry-run` first. It sends no requests and runs no fault commands, prints every command, and checks that each source is reachable. That check does run your `command` sources, since that's the only way to know they work.

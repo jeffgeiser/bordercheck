@@ -2,9 +2,14 @@
 
 Only metadata is kept: status, timing, the "served by" fields you choose, and whether the
 canary came back in the response. Response bodies are not stored.
+
+Besides the baseline and fault phases, probes check the failovers that happen with nothing down:
+a prompt longer than the local model's context window, a burst that hits a rate limit, and a
+prompt the local model or a guardrail rejects. Gateways can send each of those to a cloud model.
 """
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 
@@ -13,6 +18,8 @@ from .config import expand_env
 
 MAX_RESPONSE_BYTES = 10 << 20
 MAX_RECORDED_CHARS = 200
+
+FILLER = "Note {i}: routine correspondence on file, no action needed. "
 
 
 def render(template, values):
@@ -51,7 +58,32 @@ def _recordable(val):
     return val if len(val) <= MAX_RECORDED_CHARS else val[:MAX_RECORDED_CHARS] + "…"
 
 
-def send_phase(cfg, run, phase, n=None):
+def padding(tokens):
+    """Neutral filler of roughly `tokens` tokens (about 4 characters each), with no identifiers."""
+    out, i, size = [], 0, 0
+    while size < tokens * 4:
+        line = FILLER.format(i=i)
+        out.append(line)
+        size += len(line)
+        i += 1
+    return "".join(out)
+
+
+def probe_settings(cfg, name):
+    """(prompt template, requests, concurrency) for one configured probe."""
+    probe = cfg["probes"][name]
+    prompt = cfg["target"]["prompt"]
+    if name == "context_window":
+        prompt += "\n\nCase notes:\n" + padding(int(probe.get("pad_tokens", 40000)))
+    elif name == "content_policy":
+        prompt = probe["prompt"]
+    concurrency = int(probe.get("concurrency", 20 if name == "rate_limit" else 1))
+    return prompt, int(probe.get("requests", 60 if name == "rate_limit" else 3)), concurrency
+
+
+def send_phase(cfg, run, phase, n=None, prompt=None, concurrency=1):
+    """Send n requests labelled `phase`. prompt replaces [target] prompt (probes use this);
+    concurrency > 1 sends them in parallel, with no pause, as the rate-limit probe does."""
     target = cfg["target"]
     n = n or cfg["requests_per_phase"]
     record = run["record"]
@@ -59,13 +91,13 @@ def send_phase(cfg, run, phase, n=None):
     headers.setdefault("Content-Type", "application/json")
     http = net.opener(target["url"], target.get("ca_file"))
     timeout = float(target.get("timeout_seconds", 60))
+    template = prompt or target["prompt"]
+    slug = phase.replace(":", "-")
 
-    results = []
-    for i in range(n):
-        req_id = f"{run['run_id']}-{phase}-{i:03d}"
+    def one(i):
+        req_id = f"{run['run_id']}-{slug}-{i:03d}"
         values = dict(record, request_id=req_id, run_id=run["run_id"])
-        prompt = render(target["prompt"], values)
-        body = render_body(target["body"], dict(values, prompt=prompt)).encode()
+        body = render_body(target["body"], dict(values, prompt=render(template, values))).encode()
         req = urllib.request.Request(
             target["url"],
             data=body,
@@ -100,10 +132,14 @@ def send_phase(cfg, run, phase, n=None):
             val = get_path(parsed, path) if parsed is not None else None
             fields[path] = _recordable(val)
         entry["fields"] = fields
-        results.append(entry)
         ok = entry["status"] is not None and 200 <= entry["status"] < 300
         print(f"  {req_id}  status={entry['status']}  {entry['seconds']}s  {fields if fields else ''}"
               f"{'' if ok else '  ' + entry.get('error', '')}")
-        time.sleep(float(target.get("pause_seconds", 0.2)))
+        if concurrency == 1:
+            time.sleep(float(target.get("pause_seconds", 0.2)))
+        return entry
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        results = list(pool.map(one, range(n)))
     run["requests"].extend(results)
     return results
