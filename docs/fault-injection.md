@@ -1,0 +1,55 @@
+# Taking the local model away (and bringing it back)
+
+canarykit never decides how to break your stack. You put a `start` and `stop` command in `[fault]`, or you do it by hand between `send` phases. Pick the option closest to how a real outage would look, and agree it with whoever owns the environment.
+
+Test at least two failure shapes. They exercise different paths in most gateways.
+
+## 1. Hard down: the model is gone
+
+The gateway gets connection refused or 5xx immediately. This is the fastest failover path.
+
+```toml
+# Kubernetes
+start = "kubectl -n ai-staging scale deployment/local-llm --replicas=0"
+stop  = "kubectl -n ai-staging scale deployment/local-llm --replicas=1"
+
+# Docker
+start = "docker stop local-llm"
+stop  = "docker start local-llm"
+
+# systemd
+start = "sudo systemctl stop vllm"
+stop  = "sudo systemctl start vllm"
+```
+
+## 2. Hung: the model is there but doesn't answer
+
+This is closer to an overloaded model. Failover happens only after the gateway's timeout, so set the harness's `timeout_seconds` above that.
+
+```toml
+# Docker: freeze the process; connections open, nothing comes back
+start = "docker pause local-llm"
+stop  = "docker unpause local-llm"
+
+# Linux host: delays ALL traffic on that interface. Only on a dedicated model host; needs root
+start = "sudo tc qdisc add dev eth0 root netem delay 30000ms"
+stop  = "sudo tc qdisc del dev eth0 root"
+```
+
+## 3. Blocked: the network path is cut
+
+Useful when you can't touch the model itself.
+
+```toml
+# Kubernetes NetworkPolicy that denies ingress to the model pods (prepare the YAML first)
+start = "kubectl -n ai-staging apply -f deny-local-llm.yaml"
+stop  = "kubectl -n ai-staging delete -f deny-local-llm.yaml"
+```
+
+## Rules of thumb
+
+- Run `python -m canarykit all --dry-run` first. It sends no requests and runs no fault commands, prints every command, and checks that each source is reachable.
+- Make sure `stop` really restores service. Run it once by hand before the test.
+- Set `settle_seconds` long enough for the change to take effect (scale-down, health checks, gateway retries).
+- If a run is interrupted, canarykit reminds you to run `canarykit fault stop --run <id>`.
+- After the run, confirm the model is healthy and the gateway has gone back to it. Some gateways keep a backend in cooldown for a while after it fails.

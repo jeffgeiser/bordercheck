@@ -1,0 +1,110 @@
+# canarykit config. Copy to canarykit.toml (git-ignored) and edit.
+# Secrets are read from environment variables with ${VAR}; never put them in this file.
+
+environment = "staging"        # refuses "prod"/"production"/"live" unless you pass a deliberate flag
+output_dir = "runs"
+requests_per_phase = 20
+scan_delay_seconds = 60        # give log shippers and tracing exporters time to flush before scanning
+request_id_header = "X-Canary-Request-Id"   # sent with every request so you can find them in logs
+
+[border]
+name = "Germany"
+allowed_locations = ["DE"]     # sources whose `location` isn't listed here count as outside the border
+
+# ---------------------------------------------------------------------------
+# Where requests go in. Point this at the same entry point your applications use
+# (usually the AI gateway), not straight at the model, or you'll skip the failover logic.
+# ---------------------------------------------------------------------------
+[target]
+url = "https://ai-gateway.staging.internal/v1/chat/completions"
+method = "POST"
+headers = { Authorization = "Bearer ${GATEWAY_TOKEN}" }
+timeout_seconds = 60
+# ca_file = "/etc/ssl/certs/internal-ca.pem"
+
+# Placeholders: {{name}} {{role}} {{city}} {{product}} {{amount}} {{canary}} {{account}} {{request_id}}
+# Direct mode: identifiers are in the prompt.
+prompt = "Customer {{name}} (ref {{canary}}, account {{account}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
+# Seeded mode: load runs/<run>/seed_record.json into your test data first, then ask by name only:
+# prompt = "Summarize the open {{product}} for customer {{name}}."
+
+# {{prompt}} is JSON-escaped automatically.
+body = '{"model": "default", "messages": [{"role": "user", "content": "{{prompt}}"}]}'
+
+# Fields that reveal who answered. Without these the report can't tell local from fallback.
+record_fields = ["model"]                 # dotted paths into the JSON response
+record_headers = []                       # e.g. your gateway's "which backend served this" headers
+
+# ---------------------------------------------------------------------------
+# Your commands to take the local model away and bring it back. canarykit shows each
+# command and asks before running it. See docs/fault-injection.md.
+# ---------------------------------------------------------------------------
+[fault]
+start = "kubectl -n ai-staging scale deployment/local-llm --replicas=0"
+stop  = "kubectl -n ai-staging scale deployment/local-llm --replicas=1"
+settle_seconds = 30
+
+# ---------------------------------------------------------------------------
+# Where to look. Every source is read-only from canarykit's side; give it read-only credentials.
+# layer: data | processing | model_state | logs      location: where that store physically sits
+# type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
+# See docs/where-to-look.md for a checklist.
+# ---------------------------------------------------------------------------
+[[sources]]
+name = "Gateway logs"
+type = "command"
+command = "kubectl -n ai-staging logs deployment/ai-gateway --since=2h"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Application logs"
+type = "path"
+path = "/mnt/log-export/chat-service/"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Tracing / LLM observability"
+type = "http"
+url = "https://tracing.staging.internal/api/public/traces?limit=100"
+headers = { Authorization = "Basic ${TRACING_BASIC_AUTH}" }
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Tracing raw event storage"
+type = "command"
+# Copies down, then prints every object (decompressing .gz). Or sync it yourself and use a `path` source.
+command = "aws s3 sync s3://tracing-events-staging/ /tmp/canarykit-tracing --quiet && find /tmp/canarykit-tracing -type f -exec zcat -f {} +"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Semantic / prompt cache"
+type = "command"
+# Adapt to how your cache stores entries (hashes need HGETALL, JSON keys need JSON.GET).
+command = "redis-cli -h cache.staging.internal --scan --pattern 'llm:*' | xargs -r -n 50 redis-cli -h cache.staging.internal MGET"
+layer = "model_state"
+location = "DE"
+
+[[sources]]
+name = "Vector store (metadata and chunk text)"
+type = "command"
+command = "psql \"$VECTOR_DB_URL\" -At -c \"select metadata::text || ' ' || content from embeddings where created_at > now() - interval '3 hours'\""
+layer = "model_state"
+location = "DE"
+
+# Egress evidence: proxy, firewall, flow or DNS logs. Marked egress = true, these are also
+# searched for the watch_destinations below. With TLS inspection, canary hits show content too.
+[[sources]]
+name = "Egress proxy logs"
+type = "path"
+path = "/mnt/log-export/egress-proxy/"
+layer = "logs"
+location = "DE"
+egress = true
+
+# Public model API hostnames to flag in egress sources. Defaults cover the common providers;
+# set this to replace them, including any regional endpoints you use.
+# watch_destinations = ["api.openai.com", "*.openai.azure.com", "bedrock-runtime.*.amazonaws.com"]
