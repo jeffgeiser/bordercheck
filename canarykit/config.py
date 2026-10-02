@@ -2,6 +2,7 @@
 import os
 import re
 import tomllib
+import urllib.parse
 
 ENV_RE = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 PRODUCTION_NAMES = {"prod", "production", "live", "prd"}
@@ -27,6 +28,26 @@ def expand_env(value):
     if isinstance(value, list):
         return [expand_env(v) for v in value]
     return value
+
+
+def require_env(command):
+    """Check that every ${VAR} in a shell command is set, without substituting it.
+
+    Commands are left for the shell to expand, so a secret never becomes part of the command
+    string (where shell metacharacters in it could change the command).
+    """
+    for name in ENV_RE.findall(command):
+        if name not in os.environ:
+            raise ConfigError(f"environment variable {name} is referenced in the config but not set")
+    return command
+
+
+def _plaintext_with_credentials(url, headers):
+    """True for http:// URLs that would carry headers over the network unencrypted."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "http" or not headers:
+        return False
+    return parts.hostname not in ("localhost", "127.0.0.1", "::1")
 
 
 def load(path, allow_production=False):
@@ -59,6 +80,14 @@ def load(path, allow_production=False):
             raise ConfigError(f"source '{label}': layer must be one of {LAYERS}")
         if not src.get("location"):
             raise ConfigError(f"source '{label}': set `location` (for example \"DE\" or \"US\")")
+        urls = [src.get("url")] if isinstance(src.get("url"), str) else src.get("url") or []
+        if any(_plaintext_with_credentials(u, src.get("headers")) for u in urls) and not cfg.get("allow_plaintext_http"):
+            raise ConfigError(f"source '{label}': headers would be sent over plain http. Use https, an "
+                              "SSH tunnel to localhost, or set allow_plaintext_http = true")
+
+    if _plaintext_with_credentials(target["url"], target.get("headers")) and not cfg.get("allow_plaintext_http"):
+        raise ConfigError("[target] headers would be sent over plain http. Use https, an SSH tunnel to "
+                          "localhost, or set allow_plaintext_http = true")
 
     cfg.setdefault("output_dir", "runs")
     cfg.setdefault("requests_per_phase", 20)
@@ -81,4 +110,9 @@ DEFAULT_WATCH = [
     "api.groq.com",
     "api.deepseek.com",
     "openrouter.ai",
+    "*.services.ai.azure.com",
+    "*.cognitiveservices.azure.com",
+    "aiplatform.googleapis.com",
+    "api.x.ai",
+    "api.fireworks.ai",
 ]

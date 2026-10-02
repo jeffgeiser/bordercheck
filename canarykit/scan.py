@@ -6,11 +6,14 @@ content itself is never copied into the results.
 import gzip
 import os
 import re
-import ssl
 import subprocess
+import tempfile
+import threading
+import urllib.error
 import urllib.request
 
-from .config import expand_env
+from . import net
+from .config import expand_env, require_env
 
 CHUNK = 1 << 20
 OVERLAP = 512
@@ -19,7 +22,8 @@ MAX_HITS_PER_PATTERN = 50
 
 def _watch_regex(pattern):
     parts = [re.escape(p) for p in pattern.lower().split("*")]
-    return re.compile("[a-z0-9-]*".join(parts).encode(), re.IGNORECASE)
+    # Whole hostnames only: "api.openai.com" shouldn't match inside "myapi.openai.com".
+    return re.compile(("(?<![a-z0-9-])" + "[a-z0-9-]*".join(parts) + "(?![a-z0-9-])").encode(), re.IGNORECASE)
 
 
 def scan_stream(chunks, needles, watch):
@@ -74,14 +78,61 @@ def _bytes_chunks(data):
         yield data[i:i + CHUNK]
 
 
+class SourceError(Exception):
+    """An error whose message is safe to store: it never includes data read from the source."""
+
+
+def _command_chunks(command, timeout):
+    """Stream a shell command's stdout. stderr is shown on the terminal, never stored."""
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=err)
+        killed = threading.Event()
+        timer = threading.Timer(timeout, lambda: (killed.set(), proc.kill()))
+        timer.start()
+        try:
+            while True:
+                block = proc.stdout.read(CHUNK)
+                if not block:
+                    break
+                yield block
+        finally:
+            timer.cancel()
+            proc.stdout.close()
+            code = proc.wait()
+        if code != 0:
+            err.seek(0)
+            detail = err.read(2000).decode(errors="replace").strip()
+            if detail:
+                print("\n    stderr: " + detail.replace("\n", "\n    ") + "\n   ", end="")
+            if killed.is_set():
+                raise SourceError(f"command killed after {timeout:.0f}s timeout")
+            raise SourceError(f"command exited {code} (stderr shown on the terminal, not stored)")
+
+
+def _http_chunks(url, headers, ca_file, timeout):
+    req = urllib.request.Request(expand_env(url), headers=headers)
+    try:
+        with net.opener(req.full_url, ca_file).open(req, timeout=timeout) as resp:
+            while True:
+                block = resp.read(CHUNK)
+                if not block:
+                    return
+                yield block
+    except urllib.error.HTTPError as e:
+        raise SourceError(f"HTTP {e.code}" + (" (redirects are not followed)" if 300 <= e.code < 400 else ""))
+
+
 def _iter_targets(src):
-    """Yield (where, chunk iterator) pairs for one configured source."""
+    """Yield (where, chunk iterator) pairs for one configured source.
+
+    `where` comes from the config as written (before ${VAR} expansion), so it never holds secrets.
+    """
     kind = src["type"]
     if kind == "path":
         for root in [src["path"]] if isinstance(src["path"], str) else src["path"]:
             root = os.path.expanduser(root)
             if not os.path.exists(root):
-                raise FileNotFoundError(f"{root} does not exist")
+                raise SourceError(f"{root} does not exist")
             if os.path.isfile(root):
                 yield root, _file_chunks(root)
                 continue
@@ -90,20 +141,34 @@ def _iter_targets(src):
                     full = os.path.join(dirpath, name)
                     yield full, _file_chunks(full)
     elif kind == "command":
-        done = subprocess.run(expand_env(src["command"]), shell=True, capture_output=True,
-                              timeout=float(src.get("timeout_seconds", 300)))
-        if done.returncode != 0:
-            raise RuntimeError(f"command exited {done.returncode}: {done.stderr.decode(errors='replace')[:300]}")
-        yield "command output", _bytes_chunks(done.stdout)
+        command = require_env(src["command"])
+        yield "command output", _command_chunks(command, float(src.get("timeout_seconds", 300)))
     elif kind == "http":
         urls = [src["url"]] if isinstance(src["url"], str) else src["url"]
         headers = expand_env(dict(src.get("headers", {})))
-        ctx = ssl.create_default_context(cafile=src.get("ca_file") or None)
         for url in urls:
-            req = urllib.request.Request(expand_env(url), headers=headers)
-            with urllib.request.urlopen(req, timeout=float(src.get("timeout_seconds", 60)),
-                                        context=ctx if url.startswith("https") else None) as resp:
-                yield url, _bytes_chunks(resp.read())
+            yield url, _http_chunks(url, headers, src.get("ca_file"), float(src.get("timeout_seconds", 60)))
+
+
+def _safe_error(e):
+    """Describe an exception without copying data from the source into scan.json.
+
+    Some library messages quote what they read (gzip quotes the first bytes of a bad file),
+    so only messages we wrote, or the OS error text, are kept.
+    """
+    if isinstance(e, SourceError):
+        return str(e)
+    if isinstance(e, OSError) and e.strerror:
+        return f"{type(e).__name__}: {e.strerror}"
+    return type(e).__name__
+
+
+def _guard(chunks, failures):
+    """Pass chunks through, but turn a read failure into a recorded error so earlier hits are kept."""
+    try:
+        yield from chunks
+    except (SourceError, OSError, EOFError) as e:
+        failures.append(_safe_error(e))
 
 
 def scan_sources(cfg, needles):
@@ -116,18 +181,18 @@ def scan_sources(cfg, needles):
         print(f"  scanning {src['name']} ...", end="", flush=True)
         try:
             for where, chunks in _iter_targets(src):
-                try:
-                    hits, truncated = scan_stream(chunks, needles, watch if src.get("egress") else [])
-                except OSError as e:
-                    entry["errors"].append(f"{where}: {e}")
-                    continue
-                entry["targets_scanned"] += 1
+                failures = []
+                hits, truncated = scan_stream(_guard(chunks, failures), needles, watch if src.get("egress") else [])
+                if failures:
+                    entry["errors"].extend(f"{where}: {f}" for f in failures)
+                else:
+                    entry["targets_scanned"] += 1
                 for h in hits:
                     h["where"] = where
                 entry["hits"].extend(hits)
                 entry["truncated"].extend(f"{where}: {t}" for t in truncated)
         except Exception as e:
-            entry["errors"].append(f"{type(e).__name__}: {e}")
+            entry["errors"].append(_safe_error(e))
         n = sum(1 for h in entry["hits"] if h["kind"] in ("canary", "account"))
         print(f" {entry['targets_scanned']} target(s), {n} canary/account hit(s)"
               f"{', ERRORS' if entry['errors'] else ''}")

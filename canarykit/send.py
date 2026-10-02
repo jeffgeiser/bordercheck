@@ -4,12 +4,15 @@ Only metadata is kept: status, timing, the "served by" fields you choose, and wh
 canary came back in the response. Response bodies are not stored.
 """
 import json
-import ssl
 import time
 import urllib.error
 import urllib.request
 
+from . import net
 from .config import expand_env
+
+MAX_RESPONSE_BYTES = 10 << 20
+MAX_RECORDED_CHARS = 200
 
 
 def render(template, values):
@@ -39,9 +42,13 @@ def get_path(obj, dotted):
     return obj
 
 
-def _ssl_context(target):
-    ctx = ssl.create_default_context(cafile=target.get("ca_file") or None)
-    return ctx
+def _recordable(val):
+    """Served-by values are meant to be short labels. Anything else could be response content."""
+    if val is None or isinstance(val, (bool, int, float)):
+        return val
+    if not isinstance(val, str):
+        return f"[{type(val).__name__} not recorded]"
+    return val if len(val) <= MAX_RECORDED_CHARS else val[:MAX_RECORDED_CHARS] + "…"
 
 
 def send_phase(cfg, run, phase, n=None):
@@ -50,13 +57,13 @@ def send_phase(cfg, run, phase, n=None):
     record = run["record"]
     headers = expand_env(dict(target.get("headers", {})))
     headers.setdefault("Content-Type", "application/json")
-    ctx = _ssl_context(target) if target["url"].startswith("https") else None
+    http = net.opener(target["url"], target.get("ca_file"))
     timeout = float(target.get("timeout_seconds", 60))
 
     results = []
     for i in range(n):
         req_id = f"{run['run_id']}-{phase}-{i:03d}"
-        values = dict(record, request_id=req_id)
+        values = dict(record, request_id=req_id, run_id=run["run_id"])
         prompt = render(target["prompt"], values)
         body = render_body(target["body"], dict(values, prompt=prompt)).encode()
         req = urllib.request.Request(
@@ -68,14 +75,14 @@ def send_phase(cfg, run, phase, n=None):
         entry = {"request_id": req_id, "phase": phase, "sent": time.time()}
         start = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
-                raw = resp.read()
+            with http.open(req, timeout=timeout) as resp:
+                raw, entry["response_truncated"] = net.read_capped(resp, MAX_RESPONSE_BYTES)
                 entry["status"] = resp.status
-                entry["headers"] = {h: resp.headers.get(h) for h in target.get("record_headers", [])}
+                entry["headers"] = {h: _recordable(resp.headers.get(h)) for h in target.get("record_headers", [])}
         except urllib.error.HTTPError as e:
-            raw = e.read() or b""
+            raw, entry["response_truncated"] = net.read_capped(e, MAX_RESPONSE_BYTES)
             entry["status"] = e.code
-            entry["headers"] = {h: e.headers.get(h) for h in target.get("record_headers", [])}
+            entry["headers"] = {h: _recordable(e.headers.get(h)) for h in target.get("record_headers", [])}
         except Exception as e:  # timeouts, refused connections, TLS errors
             raw = b""
             entry["status"] = None
@@ -91,7 +98,7 @@ def send_phase(cfg, run, phase, n=None):
             parsed = None
         for path in target.get("record_fields", []):
             val = get_path(parsed, path) if parsed is not None else None
-            fields[path] = val if isinstance(val, (str, int, float, bool)) or val is None else str(val)
+            fields[path] = _recordable(val)
         entry["fields"] = fields
         results.append(entry)
         ok = entry["status"] is not None and 200 <= entry["status"] < 300

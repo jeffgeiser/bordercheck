@@ -1,9 +1,12 @@
 """Turn run.json and scan.json into a plain report a platform team, CISO or DPO can read."""
+import re
 import statistics
 import time
+import urllib.parse
 from collections import Counter
 
 from .config import LAYERS
+from .scan import MAX_HITS_PER_PATTERN, _watch_regex
 
 LAYER_NAMES = {
     "data": "Where the data lives",
@@ -28,15 +31,29 @@ def _ts(t):
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
 
 
-def _served_by(entry):
-    vals = [f"{k}={v}" for k, v in {**entry.get("fields", {}), **entry.get("headers", {})}.items()
-            if v not in (None, "")]
+HOST_RE = re.compile(r"\b(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]*(?::\d+)?|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?", re.I)
+
+
+def _redact_hosts(value, public):
+    """Replace hostnames and IPs with "(internal host)" unless they match a watched public API."""
+    def repl(m):
+        host = m.group(0).split(":")[0]
+        return m.group(0) if any(rx.fullmatch(host.encode()) for rx in public) else "(internal host)"
+    if "://" in value:
+        parts = urllib.parse.urlsplit(value)
+        value = f"{parts.scheme}://{parts.netloc}"
+    return HOST_RE.sub(repl, value)
+
+
+def _served_by(entry, public=None):
+    vals = [f"{k}={v if public is None else _redact_hosts(str(v), public)}"
+            for k, v in {**entry.get("fields", {}), **entry.get("headers", {})}.items() if v not in (None, "")]
     return ", ".join(vals) if vals else None
 
 
-def _phase_summary(requests):
+def _phase_summary(requests, public=None):
     ok = [r for r in requests if r.get("status") is not None and 200 <= r["status"] < 300]
-    served = Counter(_served_by(r) or "(no served-by fields recorded)" for r in ok)
+    served = Counter(_served_by(r, public) or "(no served-by fields recorded)" for r in ok)
     errors = Counter(r.get("error") or f"HTTP {r.get('status')}" for r in requests if r not in ok)
     secs = [r["seconds"] for r in ok]
     return {
@@ -50,13 +67,18 @@ def _phase_summary(requests):
     }
 
 
-def build(cfg, run, scan):
+def build(cfg, run, scan, redact=False):
+    """redact=True leaves out file paths, URLs, error text and fault commands, which name
+    internal hosts and layout, so the report can be shared outside the team."""
     allowed = {loc.upper() for loc in cfg["border"]["allowed_locations"]}
     border_name = cfg["border"].get("name", "/".join(sorted(allowed)))
     phases = {}
     for r in run["requests"]:
         phases.setdefault(r["phase"], []).append(r)
-    phase_info = {p: _phase_summary(reqs) for p, reqs in phases.items()}
+    public = None
+    if redact:
+        public = [_watch_regex(p) for p in cfg["watch_destinations"]]
+    phase_info = {p: _phase_summary(reqs, public) for p, reqs in phases.items()}
 
     places = []
     for s in scan:
@@ -71,6 +93,12 @@ def build(cfg, run, scan):
             })
     outside = [p for p in places if not p["inside"]]
     egress = [(s, [h for h in s["hits"] if h["kind"] == "egress"]) for s in scan if s.get("egress")]
+    seen_egress = [(s["name"], sorted({h['destination'] for h in hits})) for s, hits in egress if hits]
+    # Destinations the border allows, such as an in-region cloud endpoint you approved as a fallback.
+    approved = [_watch_regex(p) for p in cfg["border"].get("allowed_destinations", [])]
+    seen_dests = {d for _, ds in seen_egress for d in ds}
+    dests_ok = sorted(d for d in seen_dests if any(rx.fullmatch(d.encode()) for rx in approved))
+    dests_out = sorted(seen_dests - set(dests_ok))
 
     L = []
     L.append(f"# canarykit report: {run['run_id']}\n")
@@ -87,6 +115,14 @@ def build(cfg, run, scan):
     else:
         L.append("- The synthetic customer's identifiers were **not found** in any scanned source. "
                  "Check the coverage section before treating this as clean.")
+    if dests_out:
+        # A public API is outside any border a scanned store can show, so say it up front.
+        L.append(f"- **Traffic left the border** to public model APIs: {', '.join(dests_out)} "
+                 "(egress evidence, below). Without TLS inspection this shows the destination, not the payload; "
+                 "the served-by change during the fault shows what was answered from there.")
+    if dests_ok:
+        L.append(f"- Traffic reached model APIs the border allows: {', '.join(dests_ok)} "
+                 "(`allowed_destinations`). Confirm the provider's data-processing terms match.")
     base, fault = phase_info.get("baseline"), phase_info.get("fault")
     if base:
         L.append(f"- Baseline: {base['answered']} of {base['sent']} requests answered.")
@@ -111,14 +147,10 @@ def build(cfg, run, scan):
     echoed = sum(v["canary_echoed"] for v in phase_info.values())
     if echoed:
         L.append(f"- The canary came back in **{echoed}** model responses: identifiers reached the model unredacted.")
-    seen_egress = [(s["name"], sorted({h['destination'] for h in hits})) for s, hits in egress if hits]
-    if seen_egress:
-        L.append("- Egress evidence shows traffic to watched public model APIs: "
-                 + "; ".join(f"{n}: {', '.join(d)}" for n, d in seen_egress) + ".")
-    elif egress:
-        L.append("- No watched public model API destinations appeared in the egress sources.")
-    else:
+    if not egress:
         L.append("- No egress sources configured, so outbound destinations weren't checked.")
+    elif not seen_egress:
+        L.append("- No watched public model API destinations appeared in the egress sources.")
     L.append("")
 
     L.append("## By residency layer\n")
@@ -158,9 +190,11 @@ def build(cfg, run, scan):
     L.append("## Locations of hits\n")
     if places:
         for p in places:
-            L.append(f"- **{p['name']}** ({p['location']}, {p['layer']}): " + "; ".join(p["targets"][:20])
-                     + (" …" if len(p["targets"]) > 20 else ""))
-        L.append("\nFull file, line and offset detail is in `scan.json`. Contents are never copied.\n")
+            where = (f"{len(p['targets'])} target(s)" if redact else
+                     "; ".join(p["targets"][:20]) + (" …" if len(p["targets"]) > 20 else ""))
+            L.append(f"- **{p['name']}** ({p['location']}, {p['layer']}): {where}")
+        L.append("\n" + ("Paths and URLs are left out of this shareable copy. " if redact else "")
+                 + "Full file, line and offset detail is in `scan.json`. Contents are never copied.\n")
     else:
         L.append("- none\n")
 
@@ -172,7 +206,8 @@ def build(cfg, run, scan):
         rid = any(h["kind"] == "run_id" for h in s["hits"])
         ident = any(h["kind"] in ("canary", "account") for h in s["hits"])
         if s["errors"]:
-            reading = "errors: " + "; ".join(s["errors"])[:200]
+            reading = (f"{len(s['errors'])} error(s), see scan.json" if redact
+                       else "errors: " + "; ".join(s["errors"])[:200])
         elif s["targets_scanned"] == 0:
             reading = "nothing to scan (empty), so this source was not really checked"
         elif ident:
@@ -186,12 +221,13 @@ def build(cfg, run, scan):
         L.append(f"| {s['name']} | {s['targets_scanned']} | {'yes' if rid else 'no'} | {'yes' if ident else 'no'} | {reading} |")
     trunc = [t for s in scan for t in s["truncated"]]
     if trunc:
-        L.append(f"\nSome patterns hit the {50}-match cap per file; counts are lower bounds.")
+        L.append(f"\nSome patterns hit the {MAX_HITS_PER_PATTERN}-match cap per file; counts are lower bounds.")
     L.append("")
 
     L.append("## Run timeline\n")
     for e in run["events"]:
-        L.append(f"- {_ts(e['t'])}: {e['event']}" + (f" ({e['detail']})" if e.get("detail") else ""))
+        detail = e.get("detail") and not redact
+        L.append(f"- {_ts(e['t'])}: {e['event']}" + (f" ({e['detail']})" if detail else ""))
     L.append("")
 
     L.append("## Not covered by this run\n")
@@ -200,10 +236,13 @@ def build(cfg, run, scan):
     L.append("\n*This is an engineering test, not a compliance assessment or legal advice. "
              "One run, one configuration, synthetic data.*\n")
 
+    if redact:
+        places = [{k: v for k, v in p.items() if k != "targets"} for p in places]
     summary = {
         "run_id": run["run_id"], "border": border_name, "places": places,
         "places_outside_border": len(outside), "phases": phase_info,
         "egress_destinations": dict(seen_egress),
-        "layers_not_checked": [l for l in LAYERS if not any(s["layer"] == l for s in scan)],
+        "egress_outside_border": dests_out,
+        "layers_not_checked": [layer for layer in LAYERS if not any(s["layer"] == layer for s in scan)],
     }
     return "\n".join(L), summary

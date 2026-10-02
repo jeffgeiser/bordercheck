@@ -27,6 +27,7 @@ Requires Python 3.11 or newer. Nothing to install beyond that.
 ```bash
 git clone <this repo> && cd canarykit
 cp canarykit.example.toml canarykit.toml     # edit: target, border, fault commands, sources
+                                              # (or start from examples/litellm-langfuse-pgvector.toml)
 export GATEWAY_TOKEN=...                      # whatever your config references
 
 python -m canarykit all --dry-run             # sends nothing, runs no fault commands; shows them and
@@ -34,7 +35,7 @@ python -m canarykit all --dry-run             # sends nothing, runs no fault com
 python -m canarykit all                       # the real run; asks before each fault command
 ```
 
-The report lands in `runs/<run-id>/report.md`, with machine-readable detail in `summary.json` and `scan.json`.
+The report lands in `runs/<run-id>/report.md`, with machine-readable detail in `summary.json` and `scan.json`. Add `--redact` (to `all` or `report`) for a copy you can share outside the team: it leaves out file paths, URLs, internal hostnames and your fault commands, and keeps public API hostnames.
 
 If you'd rather control each step, or can't let a script touch your deployment, run them one at a time and break the model yourself:
 
@@ -45,7 +46,7 @@ python -m canarykit send  --run <id> --phase baseline
 python -m canarykit send  --run <id> --phase fault
 # ...bring it back...
 python -m canarykit scan   --run <id>
-python -m canarykit report --run <id>
+python -m canarykit report --run <id>                     # add --redact for a shareable copy
 ```
 
 ## Two ways to plant the customer
@@ -59,7 +60,8 @@ python -m canarykit report --run <id>
 - **Tell your security operations team.** A canary moving through logs may trip DLP or SIEM rules. That's a useful test, just not as a surprise. The `CNRY-` prefix makes the values easy to recognize and allow-list.
 - **Give it read-only credentials** for every source. canarykit never writes to your stores, but least privilege is the point.
 - **Point it at the real entry point.** Sending requests straight to the model skips the gateway, which is where failover decisions get made.
-- **Record who answered.** Set `record_fields` and `record_headers` so the report can tell your local model from a fallback. Many gateways can return the serving backend in a response header; check yours.
+- **Record who answered.** Set `record_fields` and `record_headers` so the report can tell your local model from a fallback. Many gateways can return the serving backend in a response header; LiteLLM sends `x-litellm-model-api-base`.
+- **Say which cloud endpoints are allowed.** If an in-region cloud fallback is part of your design, list it in `[border] allowed_destinations` so the report separates it from traffic that left the border. See `docs/enterprise-stacks.md` for why a hostname alone doesn't always prove where processing happens.
 
 ## What it can and can't see
 
@@ -77,15 +79,19 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 | Path | What it is |
 |---|---|
 | `canarykit.example.toml` | Annotated config to copy |
+| `examples/litellm-langfuse-pgvector.toml` | Complete config for LiteLLM, Langfuse, pgvector, Docker and a forward proxy |
+| `docs/enterprise-stacks.md` | Recipes for Kubernetes, log platforms, vector stores, egress, and in-region cloud fallback |
 | `docs/fault-injection.md` | Safe ways to take a local model away, and how to restore it |
 | `docs/where-to-look.md` | Checklist of stores that tend to keep copies |
 | `docs/sample-report.md` | What a report looks like, from a mock stack that fails over to a public API |
-| `canarykit/` | About 800 lines of standard-library Python |
-| `tests/` | `python -m unittest discover -s tests` |
+| `canarykit/` | About 1,000 lines of standard-library Python |
+| `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
 
 ## Design choices you can check
 
 - No third-party dependencies, no telemetry, nothing that calls home. The only network traffic is to the target and the sources you configure.
-- Secrets come from environment variables, never the config file.
-- Search results record locations and which pattern matched, never the matching content.
+- Secrets come from environment variables, never the config file. They're substituted into headers and URLs only; `command` strings are expanded by the shell, so a secret is never spliced into a command line.
+- Credentials aren't sent over plain `http://` (except to localhost), and redirects aren't followed, so a token can't be forwarded to another host.
+- Search results record locations and which pattern matched, never the matching content. Error messages are reduced to ones canarykit wrote; command stderr is shown on your terminal but not saved.
+- Run files are created readable by you only, since they name internal hosts and paths.
 - Fault commands are yours. The harness shows them, asks, logs when they ran, and tells you if the restore command failed.

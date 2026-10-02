@@ -67,7 +67,7 @@ def cmd_report(args):
     run = runs.load(cfg, args.run)
     with open(f"{runs.run_dir(cfg, args.run)}/scan.json") as f:
         results = json.load(f)
-    text, summary = report.build(cfg, run, results)
+    text, summary = report.build(cfg, run, results, redact=args.redact)
     runs.write(cfg, args.run, "report.md", text)
     runs.write(cfg, args.run, "summary.json", json.dumps(summary, indent=2))
     print(f"report: {runs.run_dir(cfg, args.run)}/report.md")
@@ -82,7 +82,11 @@ def cmd_all(args):
         print(f"\n== dry run ==\nwould send {cfg['requests_per_phase']} baseline and "
               f"{cfg['requests_per_phase']} fault request(s) to {cfg['target']['url']}")
         for action in ("start", "stop"):
-            fault.run_command(action, (cfg.get("fault") or {}).get(action), dry_run=True)
+            command = (cfg.get("fault") or {}).get(action)
+            if command:
+                fault.run_command(action, command, dry_run=True)
+            else:
+                print(f"\n[fault {action}] not configured")
         print("\n== read-only scan, to confirm every source is reachable ==")
         cmd_scan(args)
         print("\ndry run finished: no requests sent, no fault commands run.")
@@ -91,15 +95,23 @@ def cmd_all(args):
     args.phase = "baseline"
     cmd_send(args)
     print("\n== fault ==")
-    args.action = "start"
-    if cmd_fault(args):
-        args.phase = "fault"
-        cmd_send(args)
-        args.action = "stop"
-        if not cmd_fault(args):
-            print("\n!! the stop command did not complete. Restore the local model by hand.")
+    cfg = _cfg(args)
+    if not (cfg.get("fault") or {}).get("start"):
+        print("no [fault] start command configured; skipping the fault phase")
     else:
-        print("fault not started; skipping the fault phase")
+        args.action = "start"
+        if cmd_fault(args):
+            try:
+                args.phase = "fault"
+                cmd_send(args)
+            finally:
+                # Always try to restore, even if the fault phase failed or was interrupted.
+                args.action = "stop"
+                if not cmd_fault(args):
+                    print(f"\n!! the stop command did not complete. Restore the local model by hand, or run "
+                          f"`python -m canarykit fault stop --run {args.run}`.")
+        else:
+            print("fault not started; skipping the fault phase")
     print("\n== scan ==")
     cmd_scan(args)
     cmd_report(args)
@@ -132,11 +144,14 @@ def main(argv=None):
 
     r = sub.add_parser("report", help="write report.md and summary.json")
     r.add_argument("--run", required=True)
+    r.add_argument("--redact", action="store_true",
+                   help="leave out file paths, URLs and fault commands, for sharing outside the team")
     r.set_defaults(fn=cmd_report)
 
     a = sub.add_parser("all", help="new, baseline, fault, scan and report in one go")
     a.add_argument("--dry-run", action="store_true", help="show fault commands without running them")
     a.add_argument("--yes", action="store_true", help="don't ask before running fault commands")
+    a.add_argument("--redact", action="store_true", help="write a shareable report (see `report --redact`)")
     a.set_defaults(fn=cmd_all)
 
     args = p.parse_args(argv)
@@ -145,7 +160,12 @@ def main(argv=None):
     except config.ConfigError as e:
         print(f"config error: {e}")
         return 2
+    except runs.RunIdError as e:
+        print(f"error: {e}")
+        return 2
     except KeyboardInterrupt:
-        print("\ninterrupted. If a fault was started, restore the local model with `canarykit fault stop`.")
+        run = f" --run {args.run}" if getattr(args, "run", None) else " --run <id>"
+        print(f"\ninterrupted. If a fault was started, restore the local model with "
+              f"`python -m canarykit fault stop{run}`.")
         return 130
     return 0

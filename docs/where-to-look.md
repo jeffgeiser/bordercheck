@@ -5,8 +5,10 @@ Add a `[[sources]]` entry for each one that applies. Anything you leave out is r
 ## Logs and control plane (`layer = "logs"`)
 
 - AI gateway request and response logs, including debug logging someone turned on once
+- The gateway's own database (LiteLLM keeps prompts in `LiteLLM_SpendLogs` and failed calls in `LiteLLM_ErrorLogs`)
 - Application logs from every service on the path (chat service, agent runtime, tool services)
-- Container and node logs collected by your log shipper, and the platform they ship to
+- Container and node logs collected by your log shipper, and the platform they ship to. `docker logs` replays a container's stderr on stderr, so add `2>&1`
+- Model server logs (vLLM, NIM, TGI): request logging can print prompts depending on version and flags
 - LLM tracing and observability tools: query store *and* raw event storage, which is often a separate bucket
 - APM and error tracking (exceptions often capture request bodies)
 - Message queues and dead-letter queues between services

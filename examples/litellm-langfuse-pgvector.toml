@@ -1,0 +1,133 @@
+# canarykit config for a common self-hosted stack, run on the lab host itself (over SSH):
+#
+#   app -> LiteLLM proxy -> local model (vLLM, Ollama, ...), with a fallback to a public API
+#          |-> Langfuse (traces in ClickHouse, raw events in S3/MinIO)
+#          |-> Postgres (LiteLLM spend and error logs; pgvector for retrieval)
+#   containers under Docker; outbound traffic through a forward proxy (Squid or similar)
+#
+# Copy to canarykit.toml and replace every CHANGE-ME. Names follow the upstream defaults
+# (LiteLLM on :4000, Langfuse on :3000, MinIO on :9090 from Langfuse's docker-compose).
+#
+# Environment this config expects:
+#   export LITELLM_KEY=sk-...                   # a LiteLLM virtual key for the test, not the master key
+#   export LANGFUSE_AUTH=$(printf '%s:%s' "$LANGFUSE_PUBLIC_KEY" "$LANGFUSE_SECRET_KEY" | base64 | tr -d '\n')
+#   export AWS_PROFILE=langfuse-minio-readonly  # read-only MinIO credentials in ~/.aws
+#   ~/.pgpass entries for the LiteLLM and vector databases (no passwords on command lines)
+
+environment = "lab"
+output_dir = "runs"
+requests_per_phase = 20
+scan_delay_seconds = 90          # Langfuse ingests through a queue; give it time
+request_id_header = "X-Canary-Request-Id"
+
+[border]
+name = "Germany"
+allowed_locations = ["DE"]
+# allowed_destinations = ["bedrock-runtime.eu-central-1.amazonaws.com"]   # approved in-region fallback, if any
+
+[target]
+url = "http://localhost:4000/v1/chat/completions"
+headers = { Authorization = "Bearer ${LITELLM_KEY}" }
+timeout_seconds = 120            # above LiteLLM's own timeout, so a hung model fails over before we give up
+pause_seconds = 0.5
+
+prompt = "Customer {{name}} (ref {{canary}}, account {{account}}) submitted a {{product}} for {{amount}} in {{city}}. Summarize it in two sentences."
+
+# `user` becomes the Langfuse trace's user id and LiteLLM's end_user, so the coverage check sees
+# request ids without the identifiers. metadata.tags lets the Langfuse query below find the traces.
+body = '{"model": "CHANGE-ME-model-group", "user": "{{request_id}}", "metadata": {"tags": ["canarykit"]}, "messages": [{"role": "user", "content": "{{prompt}}"}]}'
+
+record_fields = ["model"]
+# Headers the LiteLLM proxy sets on every response. api-base is what tells local from fallback.
+record_headers = ["x-litellm-model-api-base", "x-litellm-model-id", "x-litellm-attempted-fallbacks"]
+
+[fault]
+# Hard down. For the hung case use `docker pause` / `docker unpause` instead.
+start = "docker stop CHANGE-ME-model-container"
+stop  = "docker start CHANGE-ME-model-container"
+settle_seconds = 30
+
+# ---------------------------------------------------------------------------
+# Logs and control plane
+# ---------------------------------------------------------------------------
+
+# Every container's stdout and stderr, as Docker's json-file driver stores them. Needs root, or
+# membership of a group that can read /var/lib/docker. If you use another log driver, swap this
+# for `docker logs` sources (with 2>&1: docker logs replays the container's stderr on stderr).
+[[sources]]
+name = "Container logs (all containers)"
+type = "path"
+path = "/var/lib/docker/containers/"
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "Application logs"
+type = "path"
+path = "CHANGE-ME/var/log/app/"
+layer = "logs"
+location = "DE"
+
+# LiteLLM keeps request and response bodies in its database when store_prompts_in_spend_logs is
+# on, and the kwargs of every failed call (the local model, during the fault) in its error log.
+[[sources]]
+name = "LiteLLM spend logs (Postgres)"
+type = "command"
+command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_id, \\"user\\", end_user, messages::text, response::text, proxy_server_request::text, metadata::text) from \\"LiteLLM_SpendLogs\\" where \\"startTime\\" > now() - interval '3 hours'" """
+layer = "logs"
+location = "DE"
+
+[[sources]]
+name = "LiteLLM error logs (Postgres)"
+type = "command"
+command = """psql -h localhost -U CHANGE-ME -d litellm -At -c "select concat_ws(' ', request_kwargs::text, exception_string) from \\"LiteLLM_ErrorLogs\\" where \\"startTime\\" > now() - interval '3 hours'" """
+layer = "logs"
+location = "DE"
+
+# Langfuse's query API (served from ClickHouse). Use a project key with read access.
+[[sources]]
+name = "Langfuse traces and generations"
+type = "http"
+url = [
+  "http://localhost:3000/api/public/traces?tags=canarykit&limit=100",
+  "http://localhost:3000/api/public/observations?type=GENERATION&limit=100",
+  "http://localhost:3000/api/public/observations?type=GENERATION&limit=100&page=2",
+]
+headers = { Authorization = "Basic ${LANGFUSE_AUTH}" }
+layer = "logs"
+location = "DE"
+
+# Langfuse v3 also writes every raw ingestion event to S3 (MinIO in the compose file) before
+# processing. It's a separate copy with its own retention.
+[[sources]]
+name = "Langfuse raw events (MinIO)"
+type = "command"
+command = "d=$(mktemp -d) && trap 'rm -rf \"$d\"' EXIT && aws --endpoint-url http://localhost:9090 s3 sync s3://langfuse/events/ \"$d\" --only-show-errors && find \"$d\" -type f -exec gzip -dcf {} +"
+timeout_seconds = 600
+layer = "logs"
+location = "DE"
+
+# ---------------------------------------------------------------------------
+# Model state
+# ---------------------------------------------------------------------------
+
+# Chunk text and metadata. These are LangChain PGVector's default names; for LlamaIndex use
+# data_<table>(text, metadata_). Seeded mode is what puts the customer here.
+[[sources]]
+name = "pgvector (chunk text and metadata)"
+type = "command"
+command = """psql -h localhost -U CHANGE-ME -d CHANGE-ME -At -c "select concat_ws(' ', cmetadata::text, document) from langchain_pg_embedding" """
+layer = "model_state"
+location = "DE"
+
+# ---------------------------------------------------------------------------
+# Egress
+# ---------------------------------------------------------------------------
+
+[[sources]]
+name = "Egress proxy"
+type = "path"
+path = "CHANGE-ME/var/log/squid/access.log"
+layer = "logs"
+location = "DE"
+egress = true
