@@ -1,7 +1,7 @@
 """Run your own commands to take the local model away and bring it back.
 
-canarykit doesn't know your stack, so it never decides how to break it. You write the
-start/stop commands; canarykit shows them, asks first, and logs when they ran.
+bordercheck doesn't know your stack, so it never decides how to break it. You write the
+start/stop commands; bordercheck shows them, asks first, and logs when they ran.
 """
 import subprocess
 

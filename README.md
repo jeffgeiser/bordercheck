@@ -1,10 +1,24 @@
-# canarykit
+# bordercheck
 
-A test harness for data residency in self-hosted AI stacks. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), triggers the gateway's fallbacks (with the in-country model taken away, and with it healthy but given a prompt too long for it or a burst of requests), then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on, a one-page summary for non-engineers, and an evidence bundle you can hand to an auditor.
+A test harness that checks whether data in your AI stack stays inside the border you drew for it. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), triggers the gateway's fallbacks (with the local model taken away, and with it healthy but given a prompt too long for it or a burst of requests), then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on, a one-page summary for non-engineers, and an evidence bundle you can hand to an auditor.
 
-Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. canarykit tests behavior instead. In our lab, with the model in Frankfurt, the customer's data still turned up in stores nobody had listed, and in a public API in the US once the local model failed over. No request returned an error.
+Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. bordercheck tests behavior instead. In our lab, with the model in Frankfurt, the customer's data still turned up in stores nobody had listed, and in a public API in the US once the local model failed over. No request returned an error.
 
 Standard-library Python 3.11+, no dependencies, read-only against everything it scans.
+
+## What counts as a border
+
+Whatever line your data has to stay inside. A country is the common case, but bordercheck only compares labels: you tag each source with a `location`, list the labels that are inside in `[border] allowed_locations`, and anything else is outside. So the border can be:
+
+| Border | `allowed_locations` | Typical driver |
+|---|---|---|
+| A country | `["DE"]` | National residency rules, a regulator's expectations |
+| A bloc | `["EU"]` or `["DE", "FR", "NL", "IE"]` | GDPR transfers outside the EEA |
+| A cloud region | `["eu-central-1"]` | A contract or data-processing agreement that names the region |
+| Your own infrastructure | `["ONPREM"]` | "No customer data goes to any third-party model", wherever it runs |
+| A regulated zone | `["PCI-ZONE"]` or `["CLIENT-A"]` | A cardholder-data segment, or one client's dedicated environment |
+
+Public model API hostnames are always watched in egress evidence and in the gateway's served-by headers. `allowed_destinations` lists the ones that count as inside, such as an approved in-region cloud endpoint.
 
 ## How it works
 
@@ -58,7 +72,7 @@ Config errors exit 2. The reasons are listed at the top of `report.md` and in `s
 | Command | What it gives you |
 |---|---|
 | `report` | Also writes `summary.html`, a one-page summary (verdict, a grid of the four layers, who answered under each condition, which identifier formats each store kept). Self-contained, no scripts, prints to one PDF page. `[report] regulatory_appendix = true` adds the regulations the evidence is relevant to (DORA Art. 28/30, GDPR Chapter V, EBA outsourcing guidelines, AI Act Art. 12) |
-| `evidence --run <id>` | A zip of the run folder with `manifest.json`: SHA-256 of every file, the canarykit and Python versions, and the config's hash. Prints the zip's own hash to record in a change or audit ticket, or sign |
+| `evidence --run <id>` | A zip of the run folder with `manifest.json`: SHA-256 of every file, the bordercheck and Python versions, and the config's hash. Prints the zip's own hash to record in a change or audit ticket, or sign |
 | `verify <zip>` | Rechecks every file in a bundle against its manifest. Exit 1 on any mismatch |
 | `diff --run <new> --against <old>` | What changed: verdict, places holding the customer, egress destinations, who answered, and stores that now keep an identifier format they used to mask. Exit 1 on a regression, so a scheduled run can alert |
 | `rescan --run <id>` | Scans again, days later, over the original run's window, and shows which stores still hold the customer. `--expect-gone` exits 1 if any do: a direct test of your retention settings |
@@ -70,14 +84,14 @@ A manifest makes changes detectable, not impossible: anyone who can rewrite the 
 Requires Python 3.11 or newer. Nothing to install beyond that.
 
 ```bash
-git clone <this repo> && cd canarykit
-cp canarykit.example.toml canarykit.toml     # edit: target, border, fault commands, sources
+git clone <this repo> && cd bordercheck
+cp bordercheck.example.toml bordercheck.toml     # edit: target, border, fault commands, sources
                                               # (or start from examples/litellm-langfuse-pgvector.toml)
 export GATEWAY_TOKEN=...                      # whatever your config references
 
-python -m canarykit all --dry-run             # sends nothing, runs no fault commands; shows them and
+python -m bordercheck all --dry-run             # sends nothing, runs no fault commands; shows them and
                                               # does a read-only scan to confirm sources are reachable
-python -m canarykit all                       # the real run; asks before each fault command
+python -m bordercheck all                       # the real run; asks before each fault command
 echo $?                                       # 0 pass, 1 fail, 3 inconclusive
 ```
 
@@ -86,17 +100,17 @@ The report lands in `runs/<run-id>/report.md`, with machine-readable detail in `
 If you'd rather control each step, or can't let a script touch your deployment, run them one at a time and break the model yourself:
 
 ```bash
-python -m canarykit new                                  # prints the run id and the canary
-python -m canarykit send  --run <id> --phase baseline
-python -m canarykit probe --run <id>                     # optional: the [probes] you configured
+python -m bordercheck new                                  # prints the run id and the canary
+python -m bordercheck send  --run <id> --phase baseline
+python -m bordercheck probe --run <id>                     # optional: the [probes] you configured
 # ...take the local model down however your team does it...
-python -m canarykit send  --run <id> --phase fault
+python -m bordercheck send  --run <id> --phase fault
 # ...bring it back...
-python -m canarykit scan   --run <id>
-python -m canarykit report --run <id>                     # add --redact for a shareable copy
+python -m bordercheck scan   --run <id>
+python -m bordercheck report --run <id>                     # add --redact for a shareable copy
 ```
 
-To gate a release or a change on it (in a pipeline that can reach staging), run `python -m canarykit all --yes --redact` and fail the job on a non-zero exit. `--yes` skips the confirmation before fault commands, so use it only where those commands are reviewed like code.
+To gate a release or a change on it (in a pipeline that can reach staging), run `python -m bordercheck all --yes --redact` and fail the job on a non-zero exit. `--yes` skips the confirmation before fault commands, so use it only where those commands are reviewed like code.
 
 ## Two ways to plant the customer
 
@@ -105,16 +119,16 @@ To gate a release or a change on it (in a pipeline that can reach staging), run 
 
 ## Before you run it
 
-- **Use staging.** canarykit refuses an environment named `prod`, `production` or `live` unless you pass a deliberately awkward flag.
+- **Use staging.** bordercheck refuses an environment named `prod`, `production` or `live` unless you pass a deliberately awkward flag.
 - **Tell your security operations team.** A canary moving through logs may trip DLP or SIEM rules. That's a useful test, just not as a surprise. The `CNRY-` prefix makes the values easy to recognize and allow-list.
-- **Give it read-only credentials** for every source. canarykit never writes to your stores, but least privilege is the point.
+- **Give it read-only credentials** for every source. bordercheck never writes to your stores, but least privilege is the point.
 - **Point it at the real entry point.** Sending requests straight to the model skips the gateway, which is where failover decisions get made.
 - **Record who answered.** Set `record_fields` and `record_headers` so the report can tell your local model from a fallback. Many gateways can return the serving backend in a response header; LiteLLM sends `x-litellm-model-api-base`.
 - **Say which cloud endpoints are allowed.** If an in-region cloud fallback is part of your design, list it in `[border] allowed_destinations` so the report separates it from traffic that left the border. See `docs/enterprise-stacks.md` for why a hostname alone doesn't always prove where processing happens.
 
 ## What it can and can't see
 
-canarykit only knows what you point it at. A clean result means *clean in the sources you listed*.
+bordercheck only knows what you point it at. A clean result means *clean in the sources you listed*.
 
 - **Egress without TLS inspection** shows where requests went (proxy, flow and DNS logs), not what they carried. With inspection, canary hits in egress logs show the content left too.
 - **The fallback provider's side** is invisible: their retention, monitoring logs and backups. The harness can show your data reached them, and their data-processing terms tell you the rest.
@@ -128,14 +142,14 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 
 | Path | What it is |
 |---|---|
-| `canarykit.example.toml` | Annotated config to copy |
+| `bordercheck.example.toml` | Annotated config to copy |
 | `examples/litellm-langfuse-pgvector.toml` | Complete config for LiteLLM, Langfuse, pgvector, Docker and a forward proxy |
 | `docs/enterprise-stacks.md` | Recipes for Kubernetes, log platforms, vector stores, egress, and in-region cloud fallback |
 | `docs/fault-injection.md` | Safe ways to take a local model away, and how to restore it |
 | `docs/where-to-look.md` | Checklist of stores that tend to keep copies |
 | `docs/sample-report.md` | What a report looks like, from a mock stack that fails over to a public API |
-| `SECURITY.md` | What canarykit runs, reads, sends and stores, and how secrets are handled |
-| `canarykit/` | About 1,800 lines of standard-library Python |
+| `SECURITY.md` | What bordercheck runs, reads, sends and stores, and how secrets are handled |
+| `bordercheck/` | About 1,800 lines of standard-library Python |
 | `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
 
 ## Design choices you can check
@@ -143,7 +157,7 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 - No third-party dependencies, no telemetry, nothing that calls home. The only network traffic is to the target and the sources you configure.
 - Secrets come from environment variables, never the config file. They're substituted into headers and URLs only; `command` strings are expanded by the shell, so a secret is never spliced into a command line.
 - Credentials aren't sent over plain `http://` (except to localhost), and redirects aren't followed, so a token can't be forwarded to another host.
-- Search results record locations and which pattern matched, never the matching content. Error messages are reduced to ones canarykit wrote; command stderr is shown on your terminal but not saved.
+- Search results record locations and which pattern matched, never the matching content. Error messages are reduced to ones bordercheck wrote; command stderr is shown on your terminal but not saved.
 - Run files are created readable by you only, since they name internal hosts and paths.
 - Fault commands are yours. The harness shows them, asks, logs when they ran, always attempts the restore command (even after an error or Ctrl-C), and tells you if it failed.
 

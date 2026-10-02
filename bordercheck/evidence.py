@@ -1,6 +1,6 @@
 """Evidence you can hand to an auditor, and comparisons over time.
 
-- manifest.json: SHA-256 of every run file, the canarykit and Python versions, and a hash of the
+- manifest.json: SHA-256 of every run file, the bordercheck and Python versions, and a hash of the
   config (which holds no secrets). Written after every report.
 - an evidence bundle: the run folder and manifest in one zip, whose own hash you can record in a
   ticket or sign (for example `cosign sign-blob` or `gpg --detach-sign`). `verify` rechecks it.
@@ -41,7 +41,7 @@ def manifest(run_path, config_path, run_id, verdict):
         "run_id": run_id,
         "verdict": verdict,
         "written_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "canarykit_version": __version__,
+        "bordercheck_version": __version__,
         "python": sys.version.split()[0],
         "platform": platform.system() + " " + platform.machine(),
         "config": {"file": os.path.basename(config_path), "sha256": sha256_file(config_path)},
@@ -96,7 +96,7 @@ def _served(summary):
 
 def diff(old, new):
     """(markdown, regressed) comparing two summary.json documents."""
-    L = [f"# canarykit diff: {new['run_id']} against {old['run_id']}\n"]
+    L = [f"# bordercheck diff: {new['run_id']} against {old['run_id']}\n"]
     regressed = False
 
     L.append(f"- Verdict: {old['verdict'].upper()} -> **{new['verdict'].upper()}**")
@@ -144,7 +144,7 @@ def retention(first_scan, later_scan, kinds, scanned_at, run_id):
         return {s["name"]: sum(1 for h in s["hits"] if h["kind"] in kinds) for s in scan}
     before, after = held(first_scan), held(later_scan)
     errors = {s["name"]: bool(s["errors"]) for s in later_scan}
-    L = [f"# canarykit retention check: {run_id}\n",
+    L = [f"# bordercheck retention check: {run_id}\n",
          f"Rescanned {time.strftime('%Y-%m-%d %H:%M', time.localtime())}, "
          f"{(time.time() - scanned_at) / 86400:.1f} days after the first scan.\n",
          "| Source | Identifier hits then | Now | Reading |", "|---|---|---|---|"]

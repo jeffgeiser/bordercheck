@@ -8,7 +8,7 @@ import tempfile
 import threading
 import unittest
 
-from canarykit import canary, cli, config, report, runs, scan, send
+from bordercheck import canary, cli, config, report, runs, scan, send
 
 
 @contextlib.contextmanager
@@ -264,7 +264,7 @@ class EndToEndTests(unittest.TestCase):
                     self.wfile.write(out)
 
             with serve(Gateway) as url:
-                cfg_path = os.path.join(d, "canarykit.toml")
+                cfg_path = os.path.join(d, "bordercheck.toml")
                 with open(cfg_path, "w") as f:
                     f.write(f"""
 environment = "lab"

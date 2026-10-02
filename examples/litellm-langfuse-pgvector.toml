@@ -1,11 +1,11 @@
-# canarykit config for a common self-hosted stack, run on the lab host itself (over SSH):
+# bordercheck config for a common self-hosted stack, run on the lab host itself (over SSH):
 #
 #   app -> LiteLLM proxy -> local model (vLLM, Ollama, ...), with a fallback to a public API
 #          |-> Langfuse (traces in ClickHouse, raw events in S3/MinIO)
 #          |-> Postgres (LiteLLM spend and error logs; pgvector for retrieval)
 #   containers under Docker; outbound traffic through a forward proxy (Squid or similar)
 #
-# Copy to canarykit.toml and replace every CHANGE-ME. Names follow the upstream defaults
+# Copy to bordercheck.toml and replace every CHANGE-ME. Names follow the upstream defaults
 # (LiteLLM on :4000, Langfuse on :3000, MinIO on :9090 from Langfuse's docker-compose).
 #
 # Environment this config expects:
@@ -35,7 +35,7 @@ prompt = "Customer {{name}} (ref {{canary}}, account {{account}}, IBAN {{iban}},
 
 # `user` becomes the Langfuse trace's user id and LiteLLM's end_user, so the coverage check sees
 # request ids without the identifiers. metadata.tags lets the Langfuse query below find the traces.
-body = '{"model": "CHANGE-ME-model-group", "user": "{{request_id}}", "metadata": {"tags": ["canarykit"]}, "messages": [{"role": "user", "content": "{{prompt}}"}]}'
+body = '{"model": "CHANGE-ME-model-group", "user": "{{request_id}}", "metadata": {"tags": ["bordercheck"]}, "messages": [{"role": "user", "content": "{{prompt}}"}]}'
 
 record_fields = ["model"]
 # Headers the LiteLLM proxy sets on every response. api-base is what tells local from fallback.
@@ -104,7 +104,7 @@ location = "DE"
 name = "Langfuse traces and generations"
 type = "http"
 url = [
-  "http://localhost:3000/api/public/traces?tags=canarykit&fromTimestamp={{run_started}}&limit=100&page={{page}}",
+  "http://localhost:3000/api/public/traces?tags=bordercheck&fromTimestamp={{run_started}}&limit=100&page={{page}}",
   "http://localhost:3000/api/public/observations?type=GENERATION&fromStartTime={{run_started}}&limit=100&page={{page}}",
 ]
 headers = { Authorization = "Basic ${LANGFUSE_AUTH}" }

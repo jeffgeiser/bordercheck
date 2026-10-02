@@ -60,7 +60,7 @@ def load(path, allow_production=False):
         raise ConfigError("set `environment` (for example \"staging\") at the top of the config")
     if env.lower() in PRODUCTION_NAMES and not allow_production:
         raise ConfigError(
-            f"environment is '{env}'. canarykit refuses to run against production unless you pass "
+            f"environment is '{env}'. bordercheck refuses to run against production unless you pass "
             "--i-understand-this-is-production. Run it in staging first."
         )
 

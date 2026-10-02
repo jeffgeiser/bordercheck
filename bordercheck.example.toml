@@ -1,6 +1,6 @@
-# canarykit config. Copy to canarykit.toml (git-ignored) and edit.
+# bordercheck config. Copy to bordercheck.toml (git-ignored) and edit.
 # Secrets are read from environment variables with ${VAR}; never put them in this file.
-# In `headers` and `url`, canarykit substitutes ${VAR}. In `command` strings it doesn't: the shell
+# In `headers` and `url`, bordercheck substitutes ${VAR}. In `command` strings it doesn't: the shell
 # expands ${VAR} itself, so quote it ("${VAR}") and a value can't change the command.
 
 environment = "staging"        # refuses "prod"/"production"/"live" unless you pass a deliberate flag
@@ -9,6 +9,9 @@ requests_per_phase = 20
 scan_delay_seconds = 60        # give log shippers and tracing exporters time to flush before scanning
 request_id_header = "X-Canary-Request-Id"   # sent with every request so you can find them in logs
 
+# The line data has to stay inside. Not only a country: a bloc ("EU"), a cloud region
+# ("eu-central-1"), your own infrastructure ("ONPREM"), a regulated zone ("PCI-ZONE"). Labels are
+# free text; each source's `location` uses the same labels.
 [border]
 name = "Germany"
 allowed_locations = ["DE"]     # sources whose `location` isn't listed here count as outside the border
@@ -46,7 +49,7 @@ record_headers = []                       # e.g. your gateway's "which backend s
 # LiteLLM proxy: ["x-litellm-model-api-base", "x-litellm-model-id", "x-litellm-attempted-fallbacks"]
 
 # ---------------------------------------------------------------------------
-# Your commands to take the local model away and bring it back. canarykit shows each
+# Your commands to take the local model away and bring it back. bordercheck shows each
 # command and asks before running it. See docs/fault-injection.md.
 # ---------------------------------------------------------------------------
 [fault]
@@ -74,7 +77,7 @@ concurrency = 20        # at most 64
 # requests = 3
 
 # ---------------------------------------------------------------------------
-# Where to look. Every source is read-only from canarykit's side; give it read-only credentials.
+# Where to look. Every source is read-only from bordercheck's side; give it read-only credentials.
 # layer: data | processing | model_state | logs      location: where that store physically sits
 # type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
 # positive_control = true marks a source that must find the customer for the run to pass.

@@ -204,7 +204,7 @@ def cmd_all(args):
                 args.action = "stop"
                 if not cmd_fault(args):
                     print(f"\n!! the stop command did not complete. Restore the local model by hand, or run "
-                          f"`python -m canarykit fault stop --run {args.run}`.")
+                          f"`python -m bordercheck fault stop --run {args.run}`.")
         else:
             print("fault not started; skipping the fault phase")
     print("\n== scan ==")
@@ -213,8 +213,8 @@ def cmd_all(args):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="canarykit", description=__doc__)
-    p.add_argument("-c", "--config", default="canarykit.toml", help="path to your config (default canarykit.toml)")
+    p = argparse.ArgumentParser(prog="bordercheck", description=__doc__)
+    p.add_argument("-c", "--config", default="bordercheck.toml", help="path to your config (default bordercheck.toml)")
     p.add_argument("--i-understand-this-is-production", action="store_true", help=argparse.SUPPRESS)
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -285,6 +285,6 @@ def main(argv=None):
     except KeyboardInterrupt:
         run = f" --run {args.run}" if getattr(args, "run", None) else " --run <id>"
         print(f"\ninterrupted. If a fault was started, restore the local model with "
-              f"`python -m canarykit fault stop{run}`.")
+              f"`python -m bordercheck fault stop{run}`.")
         return 130
     return rc if isinstance(rc, int) and not isinstance(rc, bool) else 0

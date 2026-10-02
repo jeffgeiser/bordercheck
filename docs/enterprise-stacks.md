@@ -1,9 +1,9 @@
-# Pointing canarykit at a typical enterprise AI stack
+# Pointing bordercheck at a typical enterprise AI stack
 
 Most private-GPU deployments in regulated companies look roughly like this:
 
 ```
-apps / agents ──> AI gateway ──> in-country model (vLLM, NVIDIA NIM, TGI, KServe, Triton)
+apps / agents ──> AI gateway ──> local model (vLLM, NVIDIA NIM, TGI, KServe, Triton)
  (RAG, tools)     (LiteLLM,   └─> fallback: cloud model API, in region or not
                    Kong, APIM)
       │               │
@@ -17,7 +17,7 @@ apps / agents ──> AI gateway ──> in-country model (vLLM, NVIDIA NIM, TGI
 
 ## The questions a residency review will ask
 
-| Question | What answers it in canarykit |
+| Question | What answers it in bordercheck |
 |---|---|
 | Does any request leave the border when the local model fails? | `[fault]` plus `record_headers` (who answered) plus an `egress = true` source (where traffic went) |
 | Does any request leave the border with nothing down? | `[probes]`: a prompt past the local context window, a burst past the rate limit, a prompt a guardrail refuses |
@@ -79,13 +79,13 @@ Fault commands for Kubernetes are in `fault-injection.md`. If an HPA or operator
 
 ## Scheduled runs
 
-Running canarykit on a schedule against staging turns a one-off test into a control:
+Running bordercheck on a schedule against staging turns a one-off test into a control:
 
 ```bash
-python -m canarykit all --yes --redact; rc=$?
+python -m bordercheck all --yes --redact; rc=$?
 latest=$(basename "$(ls -d runs/run-*/ | tail -1)")
-python -m canarykit diff --run "$latest" --against "$APPROVED_RUN" || echo "residency regression" >&2   # or page someone
-python -m canarykit evidence --run "$latest"
+python -m bordercheck diff --run "$latest" --against "$APPROVED_RUN" || echo "residency regression" >&2   # or page someone
+python -m bordercheck evidence --run "$latest"
 exit $rc
 ```
 
@@ -93,7 +93,7 @@ exit $rc
 
 ## Log platforms and SIEM
 
-You can't put the run's canary in a static config, but every canary starts with `CNRY`, so search for that and let canarykit pick out this run. Note that a store which masks the canary but keeps the account number will be missed by a `CNRY` search; add a second search for the account number's `99` prefix if your platform supports wildcards.
+You can't put the run's canary in a static config, but every canary starts with `CNRY`, so search for that and let bordercheck pick out this run. Note that a store which masks the canary but keeps the account number will be missed by a `CNRY` search; add a second search for the account number's `99` prefix if your platform supports wildcards.
 
 ```toml
 # Splunk: the export endpoint streams results. Credentials from a netrc file, not the command line.

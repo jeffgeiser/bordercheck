@@ -39,7 +39,7 @@ def new_run(cfg, record):
 
 def run_dir(cfg, run_id):
     if not RUN_ID_RE.match(run_id):
-        raise RunIdError(f"not a canarykit run id: {run_id!r}")
+        raise RunIdError(f"not a bordercheck run id: {run_id!r}")
     return os.path.join(cfg["output_dir"], run_id)
 
 

@@ -34,7 +34,7 @@ NOT_COVERED = [
     "Payload contents on encrypted links you don't inspect. Without TLS inspection, egress evidence "
     "shows where requests went, not what they carried.",
     "Stores you didn't list as sources. A clean result covers only what was scanned.",
-    "Backups, snapshots and replicas made after this run. `canarykit rescan` checks retention later.",
+    "Backups, snapshots and replicas made after this run. `bordercheck rescan` checks retention later.",
     "Whether embeddings can be inverted back to text. Finding no canary in a vector store "
     "doesn't mean the vectors carry no personal data.",
 ]
@@ -230,7 +230,7 @@ def _phase_lines(name, p):
 
 
 def markdown(r):
-    L = [f"# canarykit report: {r['run_id']}\n",
+    L = [f"# bordercheck report: {r['run_id']}\n",
          f"- Environment: **{r['environment']}**",
          f"- Border: **{r['border']}** (allowed locations: {', '.join(r['allowed_locations'])})",
          f"- Canary: `{r['canary']}` · synthetic account `{r['account']}`",

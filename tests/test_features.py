@@ -8,8 +8,8 @@ import time
 import unittest
 import zipfile
 
-from canarykit import canary, cli, evidence, onepager, report, scan
-from test_canarykit import Quiet, serve
+from bordercheck import canary, cli, evidence, onepager, report, scan
+from test_bordercheck import Quiet, serve
 
 
 def quiet_main(argv):
@@ -126,7 +126,7 @@ class Stack:
         self.handler = Gateway
 
     def config(self, url, extra="", fault=True):
-        path = os.path.join(self.d, "canarykit.toml")
+        path = os.path.join(self.d, "bordercheck.toml")
         fault_section = f'[fault]\nstart = "touch {self.fault}"\nstop = "rm -f {self.fault}"\nsettle_seconds = 0\n' if fault else ""
         with open(path, "w") as f:
             f.write(f"""
