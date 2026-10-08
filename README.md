@@ -2,9 +2,26 @@
 
 A test harness that checks whether data in your AI stack stays inside the border you drew for it. It sends a synthetic customer through your real entry point (usually an AI gateway such as LiteLLM), triggers the gateway's fallbacks (with the local model taken away, and with it healthy but given a prompt too long for it or a burst of requests), then searches your logs, traces, caches, vector stores and egress records for that customer. The output is a report organized by residency layer, with a pass, fail or inconclusive verdict and an exit code you can gate on, a one-page summary for non-engineers, and an evidence bundle you can hand to an auditor.
 
-Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. bordercheck tests behavior instead. In our lab, with the model in Frankfurt, the customer's data still turned up in stores nobody had listed, and in a public API in the US once the local model failed over. No request returned an error.
+Residency is usually argued from architecture diagrams and config: where the GPUs are, which region a deployment is pinned to. bordercheck tests behavior instead. In our lab (Frankfurt, a local model behind LiteLLM, retrieval over a customer table), the app masked customer names in its answers. The prompt and the application log weren't masked: retrieval had added a second customer's IBAN that the question never asked about, and every tool call logged the full record. Nothing returned an error.
 
 Standard-library Python 3.11+, no dependencies, read-only against everything it scans.
+
+## Try it
+
+No stack needed. This runs bordercheck against a simulated one on localhost (standard library only, nothing leaves your machine):
+
+```bash
+git clone https://github.com/jeffgeiser/bordercheck && cd bordercheck
+python examples/demo/demo_stack.py      # ~1 second; exits 1 because the demo stack fails
+```
+
+Add `--pace 0.3` to slow the output down (about 12 seconds) for a screen recording.
+
+It writes a full run to `demo-runs/`: `report.md`, `summary.json` and the one-page `summary.html`, which starts like this:
+
+![bordercheck one-page summary from the demo stack: FAIL, with plain-language findings and the four residency layers](docs/images/demo-summary.png)
+
+The simulated stack has a LiteLLM-style gateway that falls back to a public API on long prompts and when the local model is down, tracing that stores requests base64-encoded, a US-hosted log service, a semantic cache and an egress proxy. The full report is in [`docs/sample-report.md`](docs/sample-report.md).
 
 ## What counts as a border
 
@@ -84,7 +101,7 @@ A manifest makes changes detectable, not impossible: anyone who can rewrite the 
 Requires Python 3.11 or newer. Nothing to install beyond that.
 
 ```bash
-git clone <this repo> && cd bordercheck
+git clone https://github.com/jeffgeiser/bordercheck && cd bordercheck
 cp bordercheck.example.toml bordercheck.toml     # edit: target, border, fault commands, sources
                                               # (or start from examples/litellm-langfuse-pgvector.toml)
 export GATEWAY_TOKEN=...                      # whatever your config references
@@ -147,9 +164,11 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 | `docs/enterprise-stacks.md` | Recipes for Kubernetes, log platforms, vector stores, egress, and in-region cloud fallback |
 | `docs/fault-injection.md` | Safe ways to take a local model away, and how to restore it |
 | `docs/where-to-look.md` | Checklist of stores that tend to keep copies |
-| `docs/sample-report.md` | What a report looks like, from a mock stack that fails over to a public API |
+| `examples/demo/demo_stack.py` | A simulated stack on localhost, to see a full run without your own |
+| `docs/sample-report.md` | The report from that demo run |
+| `CONTRIBUTING.md` | How to add a recipe or a fix |
 | `SECURITY.md` | What bordercheck runs, reads, sends and stores, and how secrets are handled |
-| `bordercheck/` | About 1,800 lines of standard-library Python |
+| `bordercheck/` | About 1,900 lines of standard-library Python |
 | `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
 
 ## Design choices you can check
