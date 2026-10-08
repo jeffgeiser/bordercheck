@@ -79,7 +79,11 @@ def gateway(stack):
 
 
 def config(stack, url, pace=0.0):
+    """Write the config. Paths are relative to the current folder when the stack is inside it,
+    so nothing the run prints (commands, report paths) shows the home directory."""
     q = shlex.quote
+    if stack.startswith(os.getcwd() + os.sep):
+        stack = os.path.relpath(stack)
     fault = os.path.join(stack, "fault")
 
     def source(name, file, layer, location, extra=""):
@@ -161,7 +165,6 @@ def main(out_dir="demo-runs", extra_args=(), pace=0.0):
         server.server_close()
     run = sorted(os.listdir(os.path.join(stack, "runs")))[-1]
     summary = os.path.join(stack, "runs", run, "summary.html")
-    # Relative when possible, so a screen recording doesn't show the home directory.
     shown = os.path.relpath(summary) if summary.startswith(os.getcwd() + os.sep) else summary
     print(f"\nopen {shown} for the one-page summary")
     return rc
