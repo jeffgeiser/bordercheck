@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import json
 import os
@@ -37,6 +38,16 @@ class IdentifierTests(unittest.TestCase):
         text = f"to={rec['email'].replace('@', '%40')} tel=0{phone[3:]} iban={grouped}".encode()
         hits, _ = scan.scan_stream([text], canary.needles(rec, "run-x"), [])
         self.assertEqual({h["kind"] for h in hits}, {"email", "phone", "iban"})
+
+
+    def test_every_identifier_is_found_base64_encoded(self):
+        rec = canary.new_record()
+        prompt = f"ref {rec['canary']} acct {rec['account']} mail {rec['email']} tel {rec['phone']} iban {rec['iban']}"
+        for prefix in ("", "x", "xy"):
+            body = json.dumps({"user": "u", "messages": [{"content": prefix + prompt}]}).encode()
+            event = b'{"payload": "' + base64.b64encode(body) + b'"}'
+            hits, _ = scan.scan_stream([event], canary.needles(rec, "run-x"), [])
+            self.assertEqual({h["kind"] for h in hits}, set(canary.IDENTIFIER_KINDS), prefix)
 
 
 class WindowTests(unittest.TestCase):

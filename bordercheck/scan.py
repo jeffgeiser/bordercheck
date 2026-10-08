@@ -258,7 +258,7 @@ def scan_sources(cfg, needles, values=None):
         except Exception as e:
             entry["errors"].append(_safe_error(e))
         n = sum(1 for h in entry["hits"] if h["kind"] in IDENTIFIER_KINDS)
-        print(f" {entry['targets_scanned']} target(s), {n} canary/account hit(s)"
+        print(f" {entry['targets_scanned']} target(s), {n} identifier hit(s)"
               f"{', ERRORS' if entry['errors'] else ''}")
         results.append(entry)
     return results
