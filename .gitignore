@@ -2,3 +2,4 @@ bordercheck.toml
 runs/
 __pycache__/
 *.pyc
+demo-runs/

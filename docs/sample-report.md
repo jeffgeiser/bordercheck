@@ -1,52 +1,89 @@
-<!-- Sample output from a mock stack: a gateway that fails over to a public API when the local model is stopped. -->
-# bordercheck report: run-20261001-193431-70fd
+<!-- Sample output from examples/demo/demo_stack.py: a simulated stack on localhost, not a real environment. Generated with --redact. -->
+# bordercheck report: run-20261008-162657-796f
 
-- Environment: **staging**
+- Environment: **demo**
 - Border: **Germany** (allowed locations: DE)
-- Canary: `CNRY-P6JX-9S2J` · synthetic account `99126649441576`
-- Run created: 2026-10-01 19:34:31
+- Canary: `CNRY-GRFD-5WFG` · synthetic account `99757609175143`
+- Run created: 2026-10-08 16:26:57
+
+## Verdict: FAIL
+
+The synthetic customer's data crossed the border:
+- identifiers found in Hosted log analytics (US), outside the border
+- egress to api.openai.com, a public model API the border doesn't allow
+- Long prompt (model up): the gateway reports api.openai.com answered, a public model API the border doesn't allow
+- Local model down: the gateway reports api.openai.com answered, a public model API the border doesn't allow
+
+## What we found
+
+1. **A public model API answered with nothing down, because the prompt was too long for the local model.** The gateway reported api.openai.com for 3 of 3 requests.
+2. **A public model API answered while the local model was down.** The gateway reported api.openai.com for 5 of 5 requests.
+3. **Requests went to api.openai.com.** Egress logs show the destination; without TLS inspection they can't show the content.
+4. **Customer data is stored outside the border.** Found in Hosted log analytics (US).
+5. **The answers looked clean. The data behind them wasn't.** None of the 13 answers contained the canary or account number, but the data still left the border.
+6. **Tracing events kept the full record.** Every identifier format was stored unmasked: canary, account no., email, phone and IBAN.
+7. **Hosted log analytics masked some identifiers but not others.** Masked: email. Kept: canary, account no., phone and IBAN.
+8. **Semantic cache kept the full record.** Every identifier format was stored unmasked: canary, account no., email, phone and IBAN.
+9. **Some residency layers weren't checked.** No source covers where the data lives.
+10. **Gateway logs saw the requests but kept no identifiers.** Redaction, hashing or minimal logging is working there.
 
 ## Summary
 
-- The synthetic customer's identifiers were found in **3 place(s)**, **1 outside the border**: App logs (DE); Tracing event store (DE); Fallback provider (simulated) (US).
+- The synthetic customer's identifiers were found in **3 place(s)**, **1 outside the border**: Tracing events (DE); Hosted log analytics (US); Semantic cache (DE).
+- **Traffic left the border** to public model APIs: api.openai.com (egress evidence, below). Without TLS inspection this shows the destination, not the payload; the served-by fields show which phase was answered from there.
 - Baseline: 5 of 5 requests answered.
+- Context-window probe (prompt longer than the local model takes), with nothing down: **3 of 3** answered.
+  - Answered by **api.openai.com**, according to the served-by fields.
 - During the fault, **5 of 5** requests were still answered.
-  - They were served by something different from the baseline: `model=gpt-4o-mini, x-backend=gpt-4o-mini` (5). Confirm where that backend runs.
-- The canary came back in **5** model responses: identifiers reached the model unredacted.
-- Egress evidence shows traffic to watched public model APIs: Egress proxy: api.openai.com.
+  - Answered by **api.openai.com**, according to the served-by fields.
 
 ## By residency layer
 
 | Layer | Source | Location | Inside border | Identifier hits | Patterns |
 |---|---|---|---|---|---|
 | Where the data lives | **not checked** (no source configured) | | | | |
-| Where it's processed | Fallback provider (simulated) | US | **no** | 10 | account number, canary |
-| Where model state lives (caches, embeddings, KV offload) | Vector store export | DE | yes | 0 | - |
-| Where logs and the control plane live | App logs | DE | yes | 10 | account number, canary |
-| Where logs and the control plane live | Tracing event store | DE | yes | 5 | canary (base64 #2) |
+| Where it's processed | **not checked** (no source configured) | | | | |
+| Where model state lives (caches, embeddings, KV offload) | Semantic cache | DE | yes | 65 | IBAN, account number, canary, email, phone (as written) |
+| Where model state lives (caches, embeddings, KV offload) | Vector store | DE | yes | 0 | - |
 | Where logs and the control plane live | Gateway logs | DE | yes | 0 | - |
+| Where logs and the control plane live | Tracing events | DE | yes | 65 | IBAN (base64 #3), account number (base64 #3), canary (base64 #3), email (base64 #3), phone (base64 #3) |
+| Where logs and the control plane live | Hosted log analytics | US | **no** | 52 | IBAN, account number, canary, phone (as written) |
 | Where logs and the control plane live | Egress proxy | DE | yes | 0 | - |
 
 ## Requests by phase
 
 | Phase | Sent | Answered | Median s | Served by | Errors | Canary echoed |
 |---|---|---|---|---|---|---|
-| baseline | 5 | 5 | 0.001 | model=local-qwen, x-backend=local-qwen (5) | - | 5 |
-| fault | 5 | 5 | 0.001 | model=gpt-4o-mini, x-backend=gpt-4o-mini (5) | - | 0 |
+| baseline | 5 | 5 | 0.002 | model=qwen2.5-32b-instruct, x-litellm-model-api-base=http://(internal host) (5) | - | 0 |
+| probe:context_window | 3 | 3 | 0.002 | model=gpt-4o-mini, x-litellm-model-api-base=https://api.openai.com (3) | - | 0 |
+| fault | 5 | 5 | 0.002 | model=gpt-4o-mini, x-litellm-model-api-base=https://api.openai.com (5) | - | 0 |
+
+## Which identifier formats each store kept
+
+Stores that saw the requests. A format that's missing where others are present was masked or dropped there, which is what redaction should do.
+
+| Source | canary | account no. | email | phone | IBAN |
+|---|---|---|---|---|---|
+| Gateway logs | - | - | - | - | - |
+| Tracing events | kept | kept | kept | kept | kept |
+| Hosted log analytics | kept | kept | - | kept | kept |
+| Semantic cache | kept | kept | kept | kept | kept |
+
+Columns are the formats the prompts sent or a store kept. The phone number comes from a reserved range of 1,000, so a match can occasionally be from an earlier run.
 
 ## Egress evidence
 
-- **Egress proxy**: api.openai.com (10)
+- **Egress proxy**: api.openai.com (8)
 
-Compare timestamps in these logs with the run timeline below to tie traffic to the fault phase.
+Compare timestamps in these logs with the run timeline below to tie traffic to a phase.
 
 ## Locations of hits
 
-- **App logs** (DE, logs): /var/log/example/app_logs/app.log
-- **Tracing event store** (DE, logs): command output
-- **Fallback provider (simulated)** (US, processing): /var/log/example/us_provider/seen.log
+- **Tracing events** (DE, logs): paths left out
+- **Hosted log analytics** (US, logs): paths left out
+- **Semantic cache** (DE, model_state): paths left out
 
-Full file, line and offset detail is in `scan.json`. Contents are never copied.
+Paths and URLs are left out of this shareable copy. Full file, line and offset detail is in `scan.json`. Contents are never copied.
 
 ## Coverage check
 
@@ -54,30 +91,32 @@ Each source should at least show the harness's request ids if it sits on the req
 
 | Source | Targets scanned | Saw request ids | Saw identifiers | Reading |
 |---|---|---|---|---|
-| App logs | 1 | yes | yes | holds the customer's identifiers |
-| Tracing event store | 1 | yes | yes | holds the customer's identifiers |
 | Gateway logs | 1 | yes | no | saw the requests but not the identifiers: redacted, hashed or not stored here |
-| Vector store export | 0 | no | no | nothing to scan (empty), so this source was not really checked |
-| Fallback provider (simulated) | 1 | no | yes | holds the customer's identifiers |
+| Tracing events | 1 | yes | yes | positive control: found, as expected |
+| Hosted log analytics | 1 | yes | yes | holds the customer's identifiers |
+| Semantic cache | 1 | no | yes | holds the customer's identifiers |
+| Vector store | 1 | no | no | saw neither: off the request path, outside the time window, or not shipping logs |
 | Egress proxy | 1 | no | no | egress source (request ids usually aren't visible here) |
 
 ## Run timeline
 
-- 2026-10-01 19:34:31: run created
-- 2026-10-01 19:34:31: baseline phase started
-- 2026-10-01 19:34:31: baseline phase finished
-- 2026-10-01 19:34:31: fault start (touch /var/log/example/fault)
-- 2026-10-01 19:34:31: fault phase started
-- 2026-10-01 19:34:31: fault phase finished
-- 2026-10-01 19:34:31: fault stop (rm -f /var/log/example/fault)
-- 2026-10-01 19:34:31: scan finished
+- 2026-10-08 16:26:57: run created
+- 2026-10-08 16:26:57: baseline phase started
+- 2026-10-08 16:26:57: baseline phase finished
+- 2026-10-08 16:26:57: probe:context_window started
+- 2026-10-08 16:26:57: probe:context_window finished
+- 2026-10-08 16:26:57: fault start
+- 2026-10-08 16:26:57: fault phase started
+- 2026-10-08 16:26:57: fault phase finished
+- 2026-10-08 16:26:57: fault stop
+- 2026-10-08 16:26:57: scan finished
 
 ## Not covered by this run
 
 - What the fallback provider keeps on its side (retention, abuse-monitoring logs, backups). Check their data-processing terms; this harness can only show that data reached them.
 - Payload contents on encrypted links you don't inspect. Without TLS inspection, egress evidence shows where requests went, not what they carried.
 - Stores you didn't list as sources. A clean result covers only what was scanned.
-- Backups, snapshots and replicas made after this run.
+- Backups, snapshots and replicas made after this run. `bordercheck rescan` checks retention later.
 - Whether embeddings can be inverted back to text. Finding no canary in a vector store doesn't mean the vectors carry no personal data.
 
 *This is an engineering test, not a compliance assessment or legal advice. One run, one configuration, synthetic data.*
