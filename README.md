@@ -61,7 +61,7 @@ Later: `rescan` (has it expired?), `diff` (what changed since last time?), `evid
 
 **Failover with nothing down.** An outage isn't the only way a gateway reaches for a cloud model. LiteLLM, for example, has `context_window_fallbacks` for prompts the local model can't take, `fallbacks` on rate limits, and `content_policy_fallbacks` when a model or guardrail refuses. The `[probes]` section sends a prompt padded past the local context window, a concurrent burst, and optionally a prompt your guardrail rejects, all with the local model healthy. If the gateway's own response headers (such as `x-litellm-model-api-base`) name a public API, that phase fails.
 
-**Scanning the run, not "the last two hours".** Source commands and URLs can use `{{run_started}}`, `{{run_ended}}`, `{{run_minutes}}` and `{{run_id}}`, so `kubectl logs --since-time={{run_started}}` or Langfuse's `fromTimestamp={{run_started}}` cover exactly the run. An http URL with `{{page}}` is fetched page by page until the API reports the last page, so a busy tracing project can't push the run's traces off the first page and make them look clean.
+**Scanning the run, not "the last two hours".** Source commands and URLs can use `{{run_started}}`, `{{run_ended}}`, `{{run_minutes}}` and `{{run_id}}`, so `kubectl logs --since-time={{run_started}}` or Langfuse's `fromTimestamp={{run_started}}` cover exactly the run. Path sources skip files last modified before that window, so an old log cannot revive a previous canary. An http URL with `{{page}}` is fetched page by page until the API reports the last page, so a busy tracing project can't push the run's traces off the first page and make them look clean. A command that exits non-zero but still wrote output (as `kubectl logs` does when one container fails) is scanned; the exit is a note, not a failed source. Set `allow_nonzero_exit = false` on that source to treat any non-zero exit as an error. No output is always an error.
 
 **The four residency layers.** Every source is tagged with one, and a layer with no sources is reported as **not checked**, never as clean:
 
@@ -76,9 +76,9 @@ Later: `rescan` (has it expired?), `diff` (what changed since last time?), `evid
 
 | Verdict | Exit | Meaning |
 |---|---|---|
-| **pass** | 0 | No identifiers in sources outside the border, no egress to public model APIs the border doesn't allow, a positive control found the customer, and no source had errors |
-| **fail** | 1 | Identifiers were found outside the border, egress logs show traffic to a disallowed model API, or the gateway's served-by fields say a disallowed public API answered (in the fault or any probe). A found leak stands regardless of anything else |
-| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, a source outside the border that never saw this run's request ids (so its clean result proves nothing), or a different backend answered (in the fault or a probe) that neither the served-by fields nor an egress source can place |
+| **pass** | 0 | No identifiers in sources outside the border, no egress to public model APIs the border doesn't allow, a positive control found the customer, no other in-border store kept identifiers, every source outside the border showed it saw this run's request ids, and no source had errors |
+| **fail** | 1 | Identifiers were found outside the border, egress logs show traffic to a disallowed model API, or the gateway's served-by fields say a disallowed public API answered (in the fault or any probe). A found leak stands regardless of anything else. One host reached from several phases is one reason, not one per phase |
+| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, a source outside the border that never saw this run's request ids (so its clean result proves nothing), an in-border store other than the positive control kept identifiers, a different backend answered that neither served-by nor egress can place, or a fault/probe was answered with no served-by fields and no egress source |
 
 Config errors exit 2. The reasons are listed at the top of `report.md` and in `summary.json`.
 
