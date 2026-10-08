@@ -1,6 +1,7 @@
 """Run bordercheck against a simulated AI stack, with no setup. Standard library only.
 
-    python examples/demo/demo_stack.py            # writes ./demo-runs/, prints the verdict
+    python examples/demo/demo_stack.py              # writes ./demo-runs/, prints the verdict
+    python examples/demo/demo_stack.py --pace 0.3   # slower output, for screen recordings
 
 The simulated stack is a stand-in for a typical self-hosted setup:
 
@@ -17,6 +18,7 @@ The simulated stack is a stand-in for a typical self-hosted setup:
 Nothing leaves your machine: the gateway listens on localhost and the "public API" is only a
 hostname written to the egress log. Expect a FAIL with exit code 1.
 """
+import argparse
 import base64
 import json
 import os
@@ -76,7 +78,7 @@ def gateway(stack):
     return Gateway
 
 
-def config(stack, url):
+def config(stack, url, pace=0.0):
     q = shlex.quote
     fault = os.path.join(stack, "fault")
 
@@ -99,12 +101,12 @@ prompt = "Customer {{{{name}}}} (ref {{{{canary}}}}, account {{{{account}}}}, IB
 body = '{{"model": "default", "user": "{{{{request_id}}}}", "messages": [{{"role": "user", "content": "{{{{prompt}}}}"}}]}}'
 record_fields = ["model"]
 record_headers = ["x-litellm-model-api-base"]
-pause_seconds = 0
+pause_seconds = {pace}
 
 [fault]
 start = {json.dumps("touch " + q(fault))}
 stop = {json.dumps("rm -f " + q(fault))}
-settle_seconds = 0
+settle_seconds = {pace * 3}
 
 [probes.context_window]
 pad_tokens = 8000
@@ -125,7 +127,20 @@ regulatory_appendix = true
     return path
 
 
-def main(out_dir="demo-runs", extra_args=()):
+def slow_scan(seconds):
+    """Pause before each source is scanned, so the progress lines can be read on a recording.
+    Demo only: a real run should never be slowed down on purpose."""
+    from bordercheck import scan
+    original = scan._iter_targets
+
+    def paced(src, values=None):
+        time.sleep(seconds)
+        yield from original(src, values)
+
+    scan._iter_targets = paced
+
+
+def main(out_dir="demo-runs", extra_args=(), pace=0.0):
     stack = os.path.abspath(out_dir)
     shutil.rmtree(stack, ignore_errors=True)
     os.makedirs(stack)
@@ -137,15 +152,26 @@ def main(out_dir="demo-runs", extra_args=()):
     server = ThreadingHTTPServer(("127.0.0.1", 0), gateway(stack))
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        cfg = config(stack, f"http://127.0.0.1:{server.server_port}/v1/chat/completions")
+        cfg = config(stack, f"http://127.0.0.1:{server.server_port}/v1/chat/completions", pace)
+        if pace:
+            slow_scan(pace * 3)
         rc = cli.main(["-c", cfg, "all", "--yes", *extra_args])
     finally:
         server.shutdown()
         server.server_close()
     run = sorted(os.listdir(os.path.join(stack, "runs")))[-1]
-    print(f"\nopen {os.path.join(stack, 'runs', run, 'summary.html')} for the one-page summary")
+    summary = os.path.join(stack, "runs", run, "summary.html")
+    # Relative when possible, so a screen recording doesn't show the home directory.
+    shown = os.path.relpath(summary) if summary.startswith(os.getcwd() + os.sep) else summary
+    print(f"\nopen {shown} for the one-page summary")
     return rc
 
 
 if __name__ == "__main__":
-    sys.exit(main(*sys.argv[1:2]))
+    p = argparse.ArgumentParser(description="Run bordercheck against a simulated AI stack on localhost.")
+    p.add_argument("out_dir", nargs="?", default="demo-runs", help="where to write the stack and runs (default demo-runs)")
+    p.add_argument("--pace", type=float, default=0.0, metavar="SECONDS",
+                   help="pause between requests (and 3x that between sources), for screen recordings; try 0.3")
+    p.add_argument("--redact", action="store_true", help="write a shareable report (no paths or URLs)")
+    args = p.parse_args()
+    sys.exit(main(args.out_dir, ["--redact"] if args.redact else [], args.pace))

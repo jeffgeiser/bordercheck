@@ -15,6 +15,8 @@ git clone https://github.com/jeffgeiser/bordercheck && cd bordercheck
 python examples/demo/demo_stack.py      # ~1 second; exits 1 because the demo stack fails
 ```
 
+Add `--pace 0.3` to slow the output down (about 12 seconds) for a screen recording.
+
 It writes a full run to `demo-runs/`: `report.md`, `summary.json` and the one-page `summary.html`, which starts like this:
 
 ![bordercheck one-page summary from the demo stack: FAIL, with plain-language findings and the four residency layers](docs/images/demo-summary.png)
