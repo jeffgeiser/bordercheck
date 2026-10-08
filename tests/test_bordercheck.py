@@ -61,6 +61,25 @@ class ScanTests(unittest.TestCase):
         self.assertTrue(rx.search(b"CONNECT bedrock-runtime.eu-central-1.amazonaws.com:443"))
         self.assertFalse(rx.search(b"CONNECT s3.amazonaws.com:443"))
 
+    def test_path_scan_skips_files_outside_the_run_window(self):
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            old_log = os.path.join(d, "old.log")
+            new_log = os.path.join(d, "new.log")
+            for path in (old_log, new_log):
+                with open(path, "w") as f:
+                    f.write("CNRY-TEST-0001\n")
+            os.utime(old_log, (1_000, 1_000))
+            start = int(time.time()) - 30
+            cfg = {"watch_destinations": [], "sources": [
+                {"name": "logs", "type": "path", "path": d, "layer": "logs", "location": "DE"}]}
+            res = scan.scan_sources(cfg, [("canary", "canary", b"CNRY-TEST-0001")],
+                                    {"run_started_epoch": str(start)})[0]
+        self.assertEqual(len(res["hits"]), 1)
+        self.assertEqual(res["hits"][0]["where"], new_log)
+        self.assertTrue(any("run window" in w for w in res["warnings"]))
+        self.assertFalse(res["errors"])
+
     def test_missing_path_is_an_error_not_clean(self):
         cfg = {"watch_destinations": [], "sources": [
             {"name": "gone", "type": "path", "path": "/nonexistent/xyz", "layer": "logs", "location": "DE"}]}
@@ -85,8 +104,22 @@ class SourceSafetyTests(unittest.TestCase):
 
     def test_command_stderr_is_not_stored(self):
         res = scan_one({"type": "command", "command": "echo CNRY-TEST-0001; echo CNRY-TEST-0001 secret >&2; exit 3"})
+        self.assertFalse(res["errors"], "output was scanned, so a non-zero exit is not a failed source")
+        self.assertTrue(any("exited 3" in w for w in res["warnings"]))
+        self.assertNotIn("secret", json.dumps(res))
+        self.assertEqual(len(res["hits"]), 1)
+        self.assertEqual(res["targets_scanned"], 1)
+
+    def test_nonzero_without_output_is_still_an_error(self):
+        res = scan_one({"type": "command", "command": "echo went-wrong >&2; exit 3"})
+        self.assertTrue(res["errors"])
         self.assertIn("exited 3", res["errors"][0])
-        self.assertNotIn("CNRY", json.dumps(res["errors"]))
+        self.assertNotIn("went-wrong", json.dumps(res["errors"]))
+        self.assertEqual(res["targets_scanned"], 0)
+
+    def test_allow_nonzero_exit_false_is_strict(self):
+        res = scan_one({"type": "command", "command": "echo CNRY-TEST-0001; exit 3", "allow_nonzero_exit": False})
+        self.assertTrue(any("exited 3" in e for e in res["errors"]))
         self.assertEqual(len(res["hits"]), 1, "hits before the failure are kept")
 
     def test_bad_gzip_error_does_not_quote_file_contents(self):
@@ -194,6 +227,47 @@ class VerdictTests(unittest.TestCase):
         res = self._verdict([self._src("US analytics", location="US", hit=True)])
         self.assertEqual(res["verdict"], "fail")
         self.assertEqual(report.EXIT_CODES[res["verdict"]], 1)
+
+    def test_unmasked_copy_inside_the_border_is_not_a_pass(self):
+        # The positive control is expected to hold the customer. Another in-border store is not.
+        # Inconclusive, not fail: nothing crossed the border, but a pass would hide the copy.
+        res = self._verdict([self._src("traces", hit=True, control=True), self._src("cache", hit=True)])
+        self.assertEqual(res["verdict"], "inconclusive")
+        self.assertEqual(report.EXIT_CODES[res["verdict"]], 3)
+        self.assertTrue(any("cache" in r and "inside the border" in r for r in res["reasons"]))
+
+    def test_answered_failover_without_served_by_or_egress_is_inconclusive(self):
+        cfg = {"border": {"allowed_locations": ["DE"]}, "watch_destinations": config.DEFAULT_WATCH,
+               "target": {"prompt": "ref {{canary}}"}}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": {"canary": "CNRY-TEST-0001", "account": "99"},
+               "requests": [
+                   {"phase": "baseline", "status": 200, "seconds": 0.1, "fields": {}, "headers": {}},
+                   {"phase": "fault", "status": 200, "seconds": 0.1, "fields": {}, "headers": {}},
+               ]}
+        scan_res = [self._src("traces", hit=True, control=True)]
+        res = report.build(cfg, run, scan_res)[1]
+        self.assertEqual(res["verdict"], "inconclusive")
+        self.assertTrue(any("no served-by" in r for r in res["reasons"]))
+
+    def test_one_reason_when_two_phases_reach_the_same_public_host(self):
+        cfg = {"border": {"allowed_locations": ["DE"]}, "watch_destinations": config.DEFAULT_WATCH,
+               "target": {"prompt": "ref {{canary}}"}}
+        header = {"x-litellm-model-api-base": "https://api.openai.com/v1"}
+        fields = {"model": "gpt-4o-mini"}
+        def req(phase):
+            return {"phase": phase, "status": 200, "seconds": 0.1, "fields": fields, "headers": header}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": {"canary": "CNRY-TEST-0001", "account": "99"},
+               "requests": [req("probe:context_window"), req("fault")]}
+        res = report.build(cfg, run, [self._src("traces", hit=True, control=True)])[1]
+        self.assertEqual(res["verdict"], "fail")
+        host_reasons = [r for r in res["reasons"] if "api.openai.com answered during" in r]
+        self.assertEqual(len(host_reasons), 1)
+        self.assertIn("Long prompt", host_reasons[0])
+        self.assertIn("Local model down", host_reasons[0])
+        heads = [f["headline"] for f in res["findings"] if f["headline"].startswith("A public model API")]
+        self.assertEqual(len(heads), 1)
 
 
 class RunTests(unittest.TestCase):
