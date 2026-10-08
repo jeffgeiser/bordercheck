@@ -193,6 +193,10 @@ concurrency = 8
         self.assertEqual(s["phases"]["probe:context_window"]["public_hosts"], ["api.openai.com"])
         self.assertEqual(s["phases"]["probe:rate_limit"]["public_hosts"], ["api.openai.com"])
         self.assertTrue(any(r.startswith("Long prompt") for r in s["reasons"]))
+        heads = [f["headline"] for f in s["findings"]]
+        self.assertIn("A public model API answered with nothing down, because the prompt was too long for the local model.", heads)
+        self.assertIn("A public model API answered with nothing down, because of a burst of traffic.", heads)
+        self.assertEqual(s["findings"][0]["severity"], "fail")
 
     def test_allowed_destinations_cover_served_by_hosts(self):
         with tempfile.TemporaryDirectory() as d:
@@ -228,6 +232,10 @@ class EvidenceTests(unittest.TestCase):
             self.assertNotIn("email", kept(s2))
             report_md = open(os.path.join(d, "runs", second, "report.md")).read()
             self.assertIn("Which identifier formats each store kept", report_md)
+            # The mock prompt carries no phone number, so phone must not be reported as masked.
+            self.assertIn("**App logs masked some identifiers but not others.** Masked: email. Kept:", report_md)
+            self.assertIn("App logs kept the full record.", [f["headline"] for f in s1["findings"]])
+            self.assertIn("Nothing crossed the border in what was scanned.", [f["headline"] for f in s2["findings"]])
 
             # Masking more is an improvement; the reverse is a regression.
             self.assertEqual(quiet_main(["-c", cfg, "diff", "--run", second, "--against", first]), 0)
@@ -250,6 +258,18 @@ class EvidenceTests(unittest.TestCase):
             self.assertEqual(quiet_main(["-c", cfg, "rescan", "--run", second, "--expect-gone"]), 1)
             open(stack.app_log, "w").close()
             self.assertEqual(quiet_main(["-c", cfg, "rescan", "--run", second, "--expect-gone"]), 0)
+
+
+class FindingsTests(unittest.TestCase):
+    def test_failing_closed_is_reported_as_the_border_holding(self):
+        cfg = {"border": {"allowed_locations": ["DE"]}, "watch_destinations": []}
+        down = {"phase": "fault", "status": None, "error": "URLError", "seconds": 1.0, "fields": {}, "headers": {}}
+        up = {"phase": "baseline", "status": 200, "seconds": 0.1, "fields": {}, "headers": {}}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": canary.new_record(), "requests": [up, down]}
+        _text, summary = report.build(cfg, run, [])
+        self.assertIn("When the local model couldn't answer, requests failed instead of leaving.",
+                      [f["headline"] for f in summary["findings"]])
 
 
 class OnePagerTests(unittest.TestCase):

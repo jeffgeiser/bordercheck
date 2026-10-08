@@ -74,6 +74,11 @@ a{color:var(--link)}
 code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere}
 .small{font-size:12px;color:var(--muted)}
 ul.plain{margin:0;padding-left:18px}
+ol.findings{margin:0;padding-left:0;list-style:none;display:flex;flex-direction:column;gap:8px}
+ol.findings li{padding:8px 12px;border-left:3px solid var(--line);background:var(--card);border-radius:0 8px 8px 0}
+ol.findings li b{display:block}
+ol.findings li.f-fail{border-left-color:var(--fail)}ol.findings li.f-warn{border-left-color:var(--warn)}
+ol.findings li.f-ok{border-left-color:var(--pass)}
 @media print{body{font-size:11.5px}main{padding:0}.layer,.verdict{break-inside:avoid}}
 """
 
@@ -112,6 +117,11 @@ def html(r, frameworks=False):
     if r["reasons"]:
         out.append("<ul>" + "".join(f"<li>{e(x)}</li>" for x in r["reasons"]) + "</ul>")
     out.append("</section>")
+    if r.get("findings"):
+        out.append("<h2>What we found</h2><ol class='findings'>")
+        for f in r["findings"][:6]:
+            out.append(f"<li class='f-{e(f['severity'])}'><b>{e(f['headline'])}</b> {e(f['detail'])}</li>")
+        out.append("</ol>")
     out.append("<p class='small'>A synthetic customer was sent through the AI gateway; the local model was "
                "taken away and the same requests sent again; then logs, traces, caches, vector stores and "
                "egress records were searched for that customer.</p>")
@@ -131,7 +141,7 @@ def html(r, frameworks=False):
                    f"<td><code>{e(served)}</code></td></tr>")
     out.append("</table>")
 
-    kinds = r.get("kinds_planted", [])
+    kinds = r.get("kinds_sent", [])
     on_path = [s for s in r["sources"] if s["saw_request_ids"] or s["identifiers"]]
     if on_path and len(kinds) > 2:
         out.append("<h2>Redaction: which formats each store kept</h2><table><tr><th>Store</th>"
