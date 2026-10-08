@@ -111,6 +111,13 @@ def needles(record, run_id):
             ("iban", "IBAN", iban),
             ("iban", "IBAN (grouped)", _groups(iban)),
         ]
-    for i, core in enumerate(_base64_cores(canary)):
-        result.append(("canary", f"canary (base64 #{i + 1})", core))
+    # Tracing exporters and queues often store whole requests base64-encoded, so look for every
+    # identifier that way, not just the canary. Otherwise a store that encoded the account number
+    # would look like it had masked it.
+    encoded = [("canary", "canary", canary), ("account", "account number", account)]
+    if "email" in record:
+        encoded += [("email", "email", email), ("phone", "phone", record["phone"].encode()), ("iban", "IBAN", iban)]
+    for kind, label, value in encoded:
+        for i, core in enumerate(_base64_cores(value)):
+            result.append((kind, f"{label} (base64 #{i + 1})", core))
     return result

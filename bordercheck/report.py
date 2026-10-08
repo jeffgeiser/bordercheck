@@ -131,6 +131,84 @@ def verdict(sources, outside, dests_out, phases):
     return ("inconclusive", unsure) if unsure else ("pass", [])
 
 
+def _join(items):
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def findings(r):
+    """Plain-language findings, worst first: [{"severity", "headline", "detail"}].
+
+    The verdict reasons are precise but technical; these say what happened and why it matters,
+    for the people who'll act on the report.
+    """
+    out = []
+
+    def add(severity, headline, detail):
+        out.append({"severity": severity, "headline": headline, "detail": detail})
+
+    for name, p in r["phases"].items():
+        if p["public_hosts"]:
+            when = {"fault": "while the local model was down",
+                    "probe:context_window": "with nothing down, because the prompt was too long for the local model",
+                    "probe:rate_limit": "with nothing down, because of a burst of traffic",
+                    "probe:content_policy": "with nothing down, because the local model or a guardrail refused the prompt",
+                    }.get(name, f"during {name}")
+            add("fail", f"A public model API answered {when}.",
+                f"The gateway reported {_join(p['public_hosts'])} for {p['answered']} of {p['sent']} requests.")
+    leaked = [s for s in r["sources"] if s["egress"] and s["identifiers"]]
+    if leaked:
+        add("fail", "The customer's data itself left, not just the requests.",
+            f"{_join(s['name'] for s in leaked)} captured the identifiers in outbound traffic.")
+    elif r["egress_outside_border"]:
+        add("fail", f"Requests went to {_join(r['egress_outside_border'])}.",
+            "Egress logs show the destination; without TLS inspection they can't show the content.")
+    outside = [p for p in r["places"] if not p["inside"]]
+    if outside:
+        add("fail", "Customer data is stored outside the border.",
+            "Found in " + _join(f"{p['name']} ({p['location']})" for p in outside) + ".")
+    answered = sum(p["answered"] for p in r["phases"].values())
+    echoed = sum(p["canary_echoed"] + p["account_echoed"] for p in r["phases"].values())
+    if answered and not echoed and r["verdict"] == "fail":
+        add("fail", "The answers looked clean. The data behind them wasn't.",
+            f"None of the {answered} answers contained the canary or account number, but the data still left the border.")
+    kinds = r.get("kinds_sent", [])
+    for s in r["sources"]:
+        if s["egress"] or not s["identifiers"]:
+            continue
+        kept, dropped = s["kinds_found"], [k for k in kinds if k not in s["kinds_found"]]
+        if not dropped and len(kinds) > 2:
+            add("warn", f"{s['name']} kept the full record.",
+                "Every identifier format was stored unmasked: " + _join(KIND_NAMES[k] for k in kept) + ".")
+        elif dropped and len(kinds) > 2:
+            add("warn", f"{s['name']} masked some identifiers but not others.",
+                f"Masked: {_join(KIND_NAMES[k] for k in dropped)}. Kept: {_join(KIND_NAMES[k] for k in kept)}.")
+    for name, p in r["phases"].items():
+        if name != "baseline" and p["sent"] and not p["answered"]:
+            add("ok", "When the local model couldn't answer, requests failed instead of leaving." if name == "fault"
+                else f"{PHASE_LABELS.get(name, name)}: requests failed instead of leaving.",
+                "The border held. The cost was errors, so capacity inside the border matters.")
+    redacting = [s["name"] for s in r["sources"] if s["saw_request_ids"] and not s["identifiers"] and not s["egress"]]
+    if redacting:
+        add("ok", f"{_join(redacting)} saw the requests but kept no identifiers.",
+            "Redaction, hashing or minimal logging is working there.")
+    if r["verdict"] == "inconclusive":
+        add("warn", "The evidence isn't complete yet.", _join(r["reasons"]) + ".")
+    # The served-by fields and egress evidence already say where processing happened.
+    placed = any(p["public_hosts"] or p["allowed_hosts"] for p in r["phases"].values()) or r["egress_destinations"]
+    unchecked = [layer for layer in r["layers_not_checked"] if not (layer == "processing" and placed)]
+    if unchecked:
+        short = {"data": "where the data lives", "processing": "where it's processed",
+                 "model_state": "caches and embeddings", "logs": "logs and the control plane"}
+        add("warn", "Some residency layers weren't checked.",
+            "No source covers " + _join(short[layer] for layer in unchecked) + ".")
+    if r["verdict"] == "pass":
+        add("ok", "Nothing crossed the border in what was scanned.",
+            "The positive control found the customer, so the scan itself is shown to work.")
+    order = {"fail": 0, "warn": 1, "ok": 2}
+    return sorted(out, key=lambda f: order[f["severity"]])
+
+
 def analyze(cfg, run, scan, redact=False):
     """Everything the report says, as data. With redact=True, paths, URLs, error text and fault
     commands are left out and internal hostnames are masked, so it can be shared outside the team."""
@@ -156,6 +234,7 @@ def analyze(cfg, run, scan, redact=False):
 
     sources, places = [], []
     kinds_planted = [k for k in IDENTIFIER_KINDS if k in run["record"]]
+    prompts = [cfg.get("target", {}).get("prompt", "")] + [p.get("prompt", "") for p in (cfg.get("probes") or {}).values()]
     for s in scan:
         ident = [h for h in s["hits"] if h["kind"] in IDENTIFIER_KINDS]
         src = {
@@ -185,12 +264,17 @@ def analyze(cfg, run, scan, redact=False):
     result, reasons = verdict(sources, outside, dests_out, phases)
     events = [{"t": e["t"], "event": e["event"], **({"detail": e["detail"]} if e.get("detail") and not redact else {})}
               for e in run["events"]]
-    return {
+    r = {
         "run_id": run["run_id"], "environment": run["environment"], "created": run["created"],
         "verdict": result, "reasons": reasons,
         "border": border_name, "allowed_locations": sorted(allowed),
         "canary": run["record"]["canary"], "account": run["record"]["account"],
         "kinds_planted": kinds_planted,
+        # Formats known to have been sent: in a prompt template, or found in at least one store
+        # (seeded mode, where retrieval adds them). Only these can be called masked: a format
+        # that was never sent isn't missing from a store because of redaction.
+        "kinds_sent": [k for k in kinds_planted
+                       if any("{{" + k + "}}" in t for t in prompts) or any(k in s["kinds_found"] for s in sources)],
         "places": places, "places_outside_border": len(outside),
         "sources": sources, "phases": phases,
         "egress_destinations": {n: dict(c) for n, c in egress.items()},
@@ -199,6 +283,8 @@ def analyze(cfg, run, scan, redact=False):
         "redacted": redact, "events": events,
         "errors_detail": {s["name"]: s["errors"] for s in scan if s["errors"] and not redact},
     }
+    r["findings"] = findings(r)
+    return r
 
 
 def _phase_lines(name, p):
@@ -245,6 +331,12 @@ def markdown(r):
     if "fault" not in r["phases"]:
         L.append("- Note: no fault phase was run, so this says nothing about failover when the model is down.")
     L.append("")
+
+    if r["findings"]:
+        L.append("## What we found\n")
+        for i, f in enumerate(r["findings"], 1):
+            L.append(f"{i}. **{f['headline']}** {f['detail']}")
+        L.append("")
 
     L.append("## Summary\n")
     places = r["places"]
@@ -302,15 +394,15 @@ def markdown(r):
     L.append("")
 
     on_path = [s for s in r["sources"] if s["saw_request_ids"] or s["identifiers"]]
-    if on_path and len(r["kinds_planted"]) > 2:
+    if on_path and len(r["kinds_sent"]) > 2:
         L.append("## Which identifier formats each store kept\n")
         L.append("Stores that saw the requests. A format that's missing where others are present was "
                  "masked or dropped there, which is what redaction should do.\n")
-        L.append("| Source | " + " | ".join(KIND_NAMES[k] for k in r["kinds_planted"]) + " |")
-        L.append("|---|" + "---|" * len(r["kinds_planted"]))
+        L.append("| Source | " + " | ".join(KIND_NAMES[k] for k in r["kinds_sent"]) + " |")
+        L.append("|---|" + "---|" * len(r["kinds_sent"]))
         for s in on_path:
-            L.append(f"| {s['name']} | " + " | ".join("kept" if k in s["kinds_found"] else "-" for k in r["kinds_planted"]) + " |")
-        L.append("\nThe phone number comes from a reserved range of 1,000, so a match can occasionally be "
+            L.append(f"| {s['name']} | " + " | ".join("kept" if k in s["kinds_found"] else "-" for k in r["kinds_sent"]) + " |")
+        L.append("\nColumns are the formats the prompts sent or a store kept. The phone number comes from a reserved range of 1,000, so a match can occasionally be "
                  "from an earlier run.\n")
 
     if r["egress_destinations"]:
