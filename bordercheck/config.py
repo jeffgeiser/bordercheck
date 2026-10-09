@@ -81,6 +81,9 @@ def load(path, allow_production=False):
             raise ConfigError(f"source '{label}': layer must be one of {LAYERS}")
         if not src.get("location"):
             raise ConfigError(f"source '{label}': set `location` (for example \"DE\" or \"US\")")
+        for flag in ("positive_control", "egress", "expect_request_ids"):
+            if flag in src and not isinstance(src[flag], bool):
+                raise ConfigError(f"source '{label}': {flag} must be true or false")
         urls = [src.get("url")] if isinstance(src.get("url"), str) else src.get("url") or []
         if any(_plaintext_with_credentials(u, src.get("headers")) for u in urls) and not cfg.get("allow_plaintext_http"):
             raise ConfigError(f"source '{label}': headers would be sent over plain http. Use https, an "

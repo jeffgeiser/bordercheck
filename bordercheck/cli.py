@@ -55,6 +55,51 @@ def cmd_probe(args):
         runs.save(cfg, run)
 
 
+def _restore_hint(run_id):
+    return f"`python -m bordercheck fault stop --run {run_id}`"
+
+
+def _fault_step(cfg, run, action, command):
+    """Run a confirmed fault command, log it, and wait for it to take effect. True if it exited 0."""
+    ok = fault.execute(command)
+    runs.event(run, f"fault {action}" + ("" if ok else " (command failed)"), detail=command)
+    runs.save(cfg, run)
+    settle = float((cfg.get("fault") or {}).get("settle_seconds", 15))
+    if settle:
+        print(f"  waiting {settle:.0f}s for the change to take effect")
+        time.sleep(settle)
+    return ok
+
+
+def _fault_phase(args, cfg):
+    """Start, send, stop. Once the start command is confirmed, stop always runs, without asking
+    again, whatever happens in between: a failed start, a failed send, or Ctrl-C."""
+    start, stop = cfg["fault"]["start"], cfg["fault"].get("stop")
+    if not fault.confirm("start", start, args.yes):
+        print("fault not started; skipping the fault phase")
+        return
+    if not stop:
+        print("!! no [fault] stop command configured: restore the local model by hand after the run")
+    run = runs.load(cfg, args.run)
+    try:
+        if _fault_step(cfg, run, "start", start):
+            args.phase = "fault"
+            cmd_send(args)
+        else:
+            print("!! the start command failed; it may have partly run, so the stop command runs anyway")
+    finally:
+        if stop:
+            print(f"\n[fault stop] {stop}")
+            try:
+                restored = _fault_step(cfg, runs.load(cfg, args.run), "stop", stop)
+            except KeyboardInterrupt:
+                print(f"\n!! interrupted while restoring. Restore the local model by hand, or run {_restore_hint(args.run)}.")
+                raise
+            if not restored:
+                print(f"\n!! the stop command did not complete. Restore the local model by hand, or run "
+                      f"{_restore_hint(args.run)}.")
+
+
 def cmd_fault(args):
     cfg = _cfg(args)
     run = runs.load(cfg, args.run)
@@ -194,19 +239,7 @@ def cmd_all(args):
     if not (cfg.get("fault") or {}).get("start"):
         print("no [fault] start command configured; skipping the fault phase")
     else:
-        args.action = "start"
-        if cmd_fault(args):
-            try:
-                args.phase = "fault"
-                cmd_send(args)
-            finally:
-                # Always try to restore, even if the fault phase failed or was interrupted.
-                args.action = "stop"
-                if not cmd_fault(args):
-                    print(f"\n!! the stop command did not complete. Restore the local model by hand, or run "
-                          f"`python -m bordercheck fault stop --run {args.run}`.")
-        else:
-            print("fault not started; skipping the fault phase")
+        _fault_phase(args, cfg)
     print("\n== scan ==")
     cmd_scan(args)
     return cmd_report(args)

@@ -62,5 +62,5 @@ A probe that ends in errors failed closed. One that's answered by a public API i
 - Run `python -m bordercheck all --dry-run` first. It sends no requests and runs no fault commands, prints every command, and checks that each source is reachable. That check does run your `command` sources, since that's the only way to know they work.
 - Make sure `stop` really restores service. Run it once by hand before the test.
 - Set `settle_seconds` long enough for the change to take effect (scale-down, health checks, gateway retries).
-- `all` runs your `stop` command even if the fault phase fails or you press Ctrl-C (it still asks first, unless you passed `--yes`). If that doesn't complete, it prints `python -m bordercheck fault stop --run <id>` to run by hand.
+- `all` asks once, before the start command. If you agree, the stop command always runs afterwards, without asking again: after a normal fault phase, after a start command that failed partway (it may still have taken the model down), and after Ctrl-C. If stop doesn't complete, or you interrupt it, bordercheck prints `python -m bordercheck fault stop --run <id>` to run by hand. If you decline the start command, neither runs.
 - After the run, confirm the model is healthy and the gateway has gone back to it. Some gateways keep a backend in cooldown for a while after it fails.

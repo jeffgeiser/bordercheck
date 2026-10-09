@@ -81,6 +81,9 @@ concurrency = 20        # at most 64
 # layer: data | processing | model_state | logs      location: where that store physically sits
 # type:  path (files/dirs, .gz ok) | command (stdout is scanned) | http (response body is scanned)
 # positive_control = true marks a source that must find the customer for the run to pass.
+# A source outside the border must also show it saw this run's request ids, or the run is
+# inconclusive. For a store that never records them, set expect_request_ids = false (the report
+# then lists it as unverified). Egress sources default to false.
 # Commands, URLs and paths can use the run's time window: {{run_started}} {{run_ended}} (ISO 8601
 # UTC, widened by clock_skew_seconds), {{run_started_epoch}}, {{run_minutes}} and {{run_id}}.
 # An http URL with {{page}} is fetched page by page (max_pages, default 20).

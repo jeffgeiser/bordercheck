@@ -112,9 +112,10 @@ def send_phase(cfg, run, phase, n=None, prompt=None, concurrency=1):
                 entry["status"] = resp.status
                 entry["headers"] = {h: _recordable(resp.headers.get(h)) for h in target.get("record_headers", [])}
         except urllib.error.HTTPError as e:
-            raw, entry["response_truncated"] = net.read_capped(e, MAX_RESPONSE_BYTES)
-            entry["status"] = e.code
-            entry["headers"] = {h: _recordable(e.headers.get(h)) for h in target.get("record_headers", [])}
+            with e:   # an error response is still an open connection
+                raw, entry["response_truncated"] = net.read_capped(e, MAX_RESPONSE_BYTES)
+                entry["status"] = e.code
+                entry["headers"] = {h: _recordable(e.headers.get(h)) for h in target.get("record_headers", [])}
         except Exception as e:  # timeouts, refused connections, TLS errors
             raw = b""
             entry["status"] = None

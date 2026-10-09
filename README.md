@@ -78,9 +78,11 @@ Later: `rescan` (has it expired?), `diff` (what changed since last time?), `evid
 |---|---|---|
 | **pass** | 0 | No identifiers in sources outside the border, no egress to public model APIs the border doesn't allow, a positive control found the customer, and no source had errors |
 | **fail** | 1 | Identifiers were found outside the border, egress logs show traffic to a disallowed model API, or the gateway's served-by fields say a disallowed public API answered (in the fault or any probe). A found leak stands regardless of anything else |
-| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, or a different backend answered (in the fault or a probe) that neither the served-by fields nor an egress source can place |
+| **inconclusive** | 3 | Nothing crossed the border in what was scanned, but the evidence is incomplete: no positive control, a positive control that found nothing, a source with errors, a source outside the border that never saw this run's request ids (so its clean result proves nothing), or a different backend answered (in the fault or a probe) that neither the served-by fields nor an egress source can place |
 
 Config errors exit 2. The reasons are listed at the top of `report.md` and in `summary.json`.
+
+**Outside the border, clean has to be earned.** A store outside the border that finds nothing only counts if it saw this run's request ids. An empty export folder, a wrong time window or a format bordercheck can't read would otherwise look clean and pass. For a store that genuinely never records request ids, set `expect_request_ids = false` on that source: it no longer blocks a pass, but the report lists it as unverified. Egress sources default to `false`.
 
 **Positive control.** Mark one source you know stores prompts with `positive_control = true` (with seeded mode, the system of record you loaded the customer into). If it doesn't find the customer, the scan itself is broken: a wrong time window, a missing permission, a log shipper that hasn't flushed. A clean result without a working positive control can't be told apart from a broken scan, so it's never a pass.
 
@@ -169,7 +171,7 @@ This is an engineering test that produces evidence. It isn't a compliance assess
 | `CONTRIBUTING.md` | How to add a recipe or a fix |
 | `SECURITY.md` | What bordercheck runs, reads, sends and stores, and how secrets are handled |
 | `bordercheck/` | About 1,900 lines of standard-library Python |
-| `tests/` | `python -m unittest discover -s tests` (runs in CI on Python 3.11 to 3.13) |
+| `tests/` | `python tests/run.py` (runs in CI on Python 3.11 to 3.14, and fails on leaked files) |
 
 ## Design choices you can check
 

@@ -147,6 +147,7 @@ def _http_chunks(url, headers, ca_file, timeout):
                     return
                 yield block
     except urllib.error.HTTPError as e:
+        e.close()   # an error response is still an open connection
         raise SourceError(f"HTTP {e.code}" + (" (redirects are not followed)" if 300 <= e.code < 400 else ""))
 
 
@@ -171,6 +172,7 @@ def _http_pages(url, headers, ca_file, timeout, max_pages):
             with net.opener(req.full_url, ca_file).open(req, timeout=timeout) as resp:
                 body, truncated = net.read_capped(resp, MAX_PAGE_BYTES)
         except urllib.error.HTTPError as e:
+            e.close()
             raise SourceError(f"page {page}: HTTP {e.code}")
         yield page, body
         if truncated or _last_page(body, page):
@@ -241,6 +243,8 @@ def scan_sources(cfg, needles, values=None):
         entry = {k: src.get(k) for k in ("name", "type", "layer", "location")}
         entry["egress"] = bool(src.get("egress"))
         entry["positive_control"] = bool(src.get("positive_control"))
+        # Egress logs rarely record request ids; every other store should, if it's on the path.
+        entry["expect_request_ids"] = bool(src.get("expect_request_ids", not entry["egress"]))
         entry.update(hits=[], targets_scanned=0, errors=[], truncated=[])
         print(f"  scanning {src['name']} ...", end="", flush=True)
         try:
@@ -259,6 +263,7 @@ def scan_sources(cfg, needles, values=None):
             entry["errors"].append(_safe_error(e))
         n = sum(1 for h in entry["hits"] if h["kind"] in IDENTIFIER_KINDS)
         print(f" {entry['targets_scanned']} target(s), {n} identifier hit(s)"
-              f"{', ERRORS' if entry['errors'] else ''}")
+              f"{', ERRORS' if entry['errors'] else ''}"
+              f"{'  (nothing to scan: check the path, query or time window)' if not entry['targets_scanned'] and not entry['errors'] else ''}")
         results.append(entry)
     return results

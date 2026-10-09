@@ -154,7 +154,10 @@ def html(r, frameworks=False):
     out.append("<h2>Not covered</h2><ul class='plain small'>"
                "<li>What a fallback provider keeps on its side; their data-processing terms decide that.</li>"
                "<li>Stores not listed as sources, and backups made after the run.</li>"
-               "<li>Payload contents on links without TLS inspection (destinations only).</li></ul>")
+               "<li>Payload contents on links without TLS inspection (destinations only).</li>"
+               + "".join(f"<li>{e(n)}: outside the border and can't show it saw this run, so its clean result is unverified.</li>"
+                         for n in r.get("unverified", []))
+               + "</ul>")
 
     if frameworks:
         out.append("<h2>Where this evidence is relevant</h2><table>")
