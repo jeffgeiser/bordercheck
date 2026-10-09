@@ -230,7 +230,8 @@ class EvidenceTests(unittest.TestCase):
             kept = lambda s: s["sources"][0]["kinds_found"]  # noqa: E731
             self.assertIn("email", kept(s1))
             self.assertNotIn("email", kept(s2))
-            report_md = open(os.path.join(d, "runs", second, "report.md")).read()
+            with open(os.path.join(d, "runs", second, "report.md")) as f:
+                report_md = f.read()
             self.assertIn("Which identifier formats each store kept", report_md)
             # The mock prompt carries no phone number, so phone must not be reported as masked.
             self.assertIn("**App logs masked some identifiers but not others.** Masked: email. Kept:", report_md)
@@ -256,7 +257,8 @@ class EvidenceTests(unittest.TestCase):
 
             # Retention: the log still holds the customer, then it's rotated away.
             self.assertEqual(quiet_main(["-c", cfg, "rescan", "--run", second, "--expect-gone"]), 1)
-            open(stack.app_log, "w").close()
+            with open(stack.app_log, "w"):
+                pass
             self.assertEqual(quiet_main(["-c", cfg, "rescan", "--run", second, "--expect-gone"]), 0)
 
 

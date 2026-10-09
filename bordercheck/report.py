@@ -105,6 +105,11 @@ def _phase_summary(requests, public=None):
     }
 
 
+def _unverified_outside(s):
+    """Outside the border, nothing found, and no sign it saw this run (or nothing scanned)."""
+    return not s["inside"] and not s["identifiers"] and not s["errors"] and not s["saw_request_ids"]
+
+
 def verdict(sources, outside, dests_out, phases):
     """("pass" | "fail" | "inconclusive", reasons).
 
@@ -124,6 +129,10 @@ def verdict(sources, outside, dests_out, phases):
     unsure += [f"positive control {s['name']} didn't find the customer: fix that source before trusting clean results"
                for s in controls if not s["identifiers"]]
     unsure += [f"{s['name']} had errors, so it wasn't fully checked" for s in sources if s["errors"]]
+    # A store outside the border that found nothing only counts if it shows it saw this run.
+    # Otherwise an empty export, a wrong time window or an unreadable format would pass.
+    unsure += [f"{s['name']} ({s['location']}) is outside the border but never saw this run's requests, "
+               "so its clean result proves nothing" for s in sources if _unverified_outside(s) and s["expect_request_ids"]]
     if not any(s["egress"] for s in sources):
         # Unless the served-by fields name a host we can place, there's no telling where it ran.
         unsure += [f"{PHASE_LABELS.get(name, name)}: a different backend answered and no egress source shows where it runs"
@@ -194,6 +203,10 @@ def findings(r):
             "Redaction, hashing or minimal logging is working there.")
     if r["verdict"] == "inconclusive":
         add("warn", "The evidence isn't complete yet.", _join(r["reasons"]) + ".")
+    if r.get("unverified"):
+        add("warn", "Some stores outside the border couldn't show they saw this run.",
+            f"{_join(r['unverified'])} {'is' if len(r['unverified']) == 1 else 'are'} configured with "
+            "expect_request_ids = false, so a clean result there is unverified.")
     # The served-by fields and egress evidence already say where processing happened.
     placed = any(p["public_hosts"] or p["allowed_hosts"] for p in r["phases"].values()) or r["egress_destinations"]
     unchecked = [layer for layer in r["layers_not_checked"] if not (layer == "processing" and placed)]
@@ -241,6 +254,8 @@ def analyze(cfg, run, scan, redact=False):
             "name": s["name"], "layer": s["layer"], "location": s["location"],
             "inside": s["location"].upper() in allowed, "egress": s.get("egress", False),
             "positive_control": s.get("positive_control", False),
+            # Scans from before this field existed: same default as scan_sources.
+            "expect_request_ids": s.get("expect_request_ids", not s.get("egress", False)),
             "targets_scanned": s["targets_scanned"], "errors": len(s["errors"]),
             "identifiers": bool(ident), "saw_request_ids": any(h["kind"] == "run_id" for h in s["hits"]),
             "kinds_found": sorted({h["kind"] for h in ident}, key=IDENTIFIER_KINDS.index),
@@ -283,6 +298,9 @@ def analyze(cfg, run, scan, redact=False):
         "redacted": redact, "events": events,
         "errors_detail": {s["name"]: s["errors"] for s in scan if s["errors"] and not redact},
     }
+    # Outside-border stores that can't show they saw the run and were told not to expect to.
+    r["unverified"] = [f"{s['name']} ({s['location']})" for s in sources
+                       if _unverified_outside(s) and not s["expect_request_ids"]]
     r["findings"] = findings(r)
     return r
 
@@ -328,6 +346,9 @@ def markdown(r):
               "fail": "The synthetic customer's data crossed the border:",
               "inconclusive": "Nothing crossed the border in what was scanned, but the evidence isn't complete:"}[r["verdict"]])
     L.extend(f"- {x}" for x in r["reasons"])
+    for name in r.get("unverified", []):
+        L.append(f"- Unverified: {name} is outside the border and can't show it saw this run "
+                 "(expect_request_ids = false), so its clean result rests on configuration, not evidence.")
     if "fault" not in r["phases"]:
         L.append("- Note: no fault phase was run, so this says nothing about failover when the model is down.")
     L.append("")
@@ -432,6 +453,9 @@ def markdown(r):
     for s in r["sources"]:
         if s["positive_control"] and not s["identifiers"]:
             reading = "**positive control did not find the customer**: this source, or the scan, isn't working"
+        elif _unverified_outside(s):
+            reading = ("**outside the border and never saw this run's requests**: its clean result proves nothing"
+                       + (" (expect_request_ids = false, so it doesn't block a pass)" if not s["expect_request_ids"] else ""))
         elif s["errors"]:
             reading = (f"{s['errors']} error(s), see scan.json" if r["redacted"]
                        else "errors: " + "; ".join(r["errors_detail"][s["name"]])[:200])

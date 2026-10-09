@@ -18,7 +18,7 @@ Recipes for other parts of the stack are the most useful contribution: a gateway
 ## Code changes
 
 ```bash
-python -m unittest discover -s tests      # must pass on Python 3.11, 3.12 and 3.13 (CI runs all three)
+python tests/run.py                       # must pass on Python 3.11 to 3.14; also fails on leaked files
 python examples/demo/demo_stack.py        # should still end in FAIL with the documented findings
 ```
 
