@@ -91,8 +91,9 @@ class SourceSafetyTests(unittest.TestCase):
 
     def test_bad_gzip_error_does_not_quote_file_contents(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "x.gz"), "wb") as f:
-                f.write(b"CNRY-TEST-0001 not gzip")
+            # gzip magic bytes, then garbage that happens to contain the canary
+            with open(os.path.join(d, "x.log"), "wb") as f:
+                f.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xffCNRY-TEST-0001 corrupt deflate data")
             res = scan_one({"type": "path", "path": d})
         self.assertTrue(res["errors"])
         self.assertNotIn("CNRY", json.dumps(res))

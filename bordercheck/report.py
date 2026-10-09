@@ -35,6 +35,8 @@ NOT_COVERED = [
     "shows where requests went, not what they carried.",
     "Stores you didn't list as sources. A clean result covers only what was scanned.",
     "Backups, snapshots and replicas made after this run. `bordercheck rescan` checks retention later.",
+    "Binary and columnar formats bordercheck can't decode (Parquet, ORC, Avro, Snappy, LZ4, ZIP, protobuf "
+    "batches). Recognised ones are reported as errors, not searched; unrecognised binary data is searched as raw bytes.",
     "Whether embeddings can be inverted back to text. Finding no canary in a vector store "
     "doesn't mean the vectors carry no personal data.",
 ]

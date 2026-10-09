@@ -91,6 +91,8 @@ def needles(record, run_id):
     result = [
         ("canary", "canary", canary),
         ("canary", "canary (lowercase)", canary.lower()),
+        # JSON serializers may write "-" as \u002d (and "@" and "+" below).
+        ("canary", "canary (JSON-escaped)", canary.replace(b"-", b"\\u002d")),
         ("account", "account number", account),
         ("account", "account number (spaced)", _groups(account)),
         ("run_id", "harness request id", run_id.encode()),
@@ -104,12 +106,18 @@ def needles(record, run_id):
         result += [
             ("email", "email", email),
             ("email", "email (URL-encoded)", local + b"%40" + domain),
+            ("email", "email (uppercase)", email.upper()),
+            ("email", "email (capitalized)", b".".join(part.capitalize() for part in local.split(b".")) + b"@" + domain),
+            ("email", "email (JSON-escaped)", local + b"\\u0040" + domain),
             ("phone", "phone (international)", phone),
+            ("phone", "phone (JSON-escaped)", b"\\u002b" + phone[1:]),
             ("phone", "phone (as written)", record["phone"].encode()),
             ("phone", "phone (national)", b"0" + phone[3:]),
             ("phone", "phone (national, spaced)", b"069 " + phone[5:]),
             ("iban", "IBAN", iban),
             ("iban", "IBAN (grouped)", _groups(iban)),
+            ("iban", "IBAN (lowercase)", iban.lower()),
+            ("iban", "IBAN (lowercase, grouped)", _groups(iban.lower())),
         ]
     # Tracing exporters and queues often store whole requests base64-encoded, so look for every
     # identifier that way, not just the canary. Otherwise a store that encoded the account number
