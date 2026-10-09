@@ -33,6 +33,9 @@ url = "{url}"
 prompt = "ref {{{{canary}}}}"
 body = '{{"user": "{{{{request_id}}}}", "messages": [{{"role": "user", "content": "{{{{prompt}}}}"}}]}}'
 pause_seconds = 0
+# Record who answered: without served-by fields or an egress source, an answered fault
+# phase is inconclusive (PR #4), which would mask the outside-border checks these tests isolate.
+record_fields = ["model"]
 [fault]
 start = {json.dumps(start)}
 stop = {json.dumps(stop)}
