@@ -8,17 +8,20 @@ rather than "the last two hours": {{run_started}} and {{run_ended}} (ISO 8601 UT
 clock_skew_seconds), {{run_started_epoch}}, {{run_minutes}} (whole minutes since the run started,
 for flags like --since=...m) and {{run_id}}. An http URL with {{page}} is fetched page by page.
 """
-import gzip
+import bz2
 import json
+import lzma
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import zlib
 
 from . import net
 from .canary import IDENTIFIER_KINDS
@@ -92,8 +95,7 @@ def scan_stream(chunks, needles, watch):
 
 
 def _file_chunks(path):
-    opener = gzip.open if path.endswith(".gz") else open
-    with opener(path, "rb") as f:
+    with open(path, "rb") as f:
         while True:
             block = f.read(CHUNK)
             if not block:
@@ -180,6 +182,155 @@ def _http_pages(url, headers, ca_file, timeout, max_pages):
     print(f"\n    stopped at max_pages = {max_pages}; there may be more", end="")
 
 
+# Compression is recognised from the data itself, not a file name: rotated logs, S3 objects and
+# command output often carry no extension. Formats bordercheck can't decode are reported as
+# errors, so a store full of them is never mistaken for a clean one.
+GZIP, ZSTD, BZIP2, XZ = b"\x1f\x8b", b"\x28\xb5\x2f\xfd", b"BZh", b"\xfd7zXZ\x00"
+UNREADABLE = [
+    (b"PAR1", "Parquet"),
+    (b"ORC", "ORC"),
+    (b"Obj\x01", "Avro"),
+    (b"\xff\x06\x00\x00sNaPpY", "Snappy-framed"),
+    (b"\x04\x22\x4d\x18", "LZ4"),
+    (b"PK\x03\x04", "ZIP"),
+]
+
+
+def _zstd_decompressor():
+    try:
+        from compression import zstd   # standard library from Python 3.14
+    except ImportError:
+        return None
+    return zstd.ZstdDecompressor
+
+
+def _stream(first, rest, new, magic, name):
+    """Decompress a stream of chunks with an incremental decompressor. Handles concatenated
+    members (rotated and appended gzip logs); stops at trailing bytes that aren't another member.
+    Each call returns at most CHUNK bytes, so a small file that expands to gigabytes is searched
+    piece by piece instead of being held in memory."""
+    state = {"d": new(), "fed": False}
+
+    def feed(data):
+        while True:
+            d = state["d"]
+            try:
+                out = d.decompress(data, CHUNK)
+            except Exception:
+                raise SourceError(f"{name} data is corrupt; searched up to that point")
+            state["fed"] = True
+            if out:
+                yield out
+            if d.eof:
+                data = d.unused_data
+                if not data.startswith(magic):
+                    return
+                state["d"], state["fed"] = new(), False
+            elif hasattr(d, "unconsumed_tail"):   # zlib keeps input it hasn't decoded yet
+                data = d.unconsumed_tail
+                if not data:
+                    return
+            elif d.needs_input:                     # bz2, lzma, zstd buffer it internally
+                return
+            else:
+                data = b""
+
+    yield from feed(first)
+    for chunk in rest:
+        yield from feed(chunk)
+    if state["fed"] and not state["d"].eof:
+        raise SourceError(f"{name} data ended early; searched up to that point")
+
+
+def _zstd_command(first, rest):
+    """Decode zstd with the zstd command, for Pythons without compression.zstd."""
+    proc = subprocess.Popen(["zstd", "-dcq"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL)
+    feeder_error = []
+
+    def feed():
+        try:
+            proc.stdin.write(first)
+            for chunk in rest:
+                proc.stdin.write(chunk)
+        except BrokenPipeError:
+            pass
+        except Exception as e:   # e.g. the source command failing; re-raised below
+            feeder_error.append(e)
+        finally:
+            try:
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+
+    writer = threading.Thread(target=feed, daemon=True)
+    writer.start()
+    try:
+        while True:
+            block = proc.stdout.read(CHUNK)
+            if not block:
+                break
+            yield block
+    finally:
+        proc.stdout.close()
+        writer.join()
+        code = proc.wait()
+    if feeder_error:
+        raise feeder_error[0]
+    if code != 0:
+        raise SourceError("zstd data is corrupt; searched up to that point")
+
+
+def _decode(chunks):
+    """Pass plain data through; decompress gzip, zstd, bzip2 and xz; refuse formats it can't read.
+
+    The first 16 bytes decide. If the source fails while those are being read (a command that
+    prints one line, then exits non-zero), what was read is still searched before the error is raised.
+    """
+    chunks = iter(chunks)
+    first, pending = b"", None
+    try:
+        for chunk in chunks:
+            first += chunk
+            if len(first) >= 16:
+                break
+    except Exception as e:
+        pending, chunks = e, iter(())
+    try:
+        yield from _by_format(first, chunks)
+    except SourceError:
+        if pending:
+            raise pending   # the source's own failure explains a short stream better
+        raise
+    if pending:
+        raise pending
+
+
+def _by_format(first, chunks):
+    if first.startswith(GZIP):
+        yield from _stream(first, chunks, lambda: zlib.decompressobj(31), GZIP, "gzip")
+    elif first.startswith(ZSTD):
+        new = _zstd_decompressor()
+        if new:
+            yield from _stream(first, chunks, new, ZSTD, "zstd")
+        elif shutil.which("zstd"):
+            yield from _zstd_command(first, chunks)
+        else:
+            raise SourceError("zstd-compressed data found but no decoder: use Python 3.14+ or install the "
+                              "zstd command; nothing here was searched")
+    elif first.startswith(BZIP2):
+        yield from _stream(first, chunks, bz2.BZ2Decompressor, BZIP2, "bzip2")
+    elif first.startswith(XZ):
+        yield from _stream(first, chunks, lzma.LZMADecompressor, XZ, "xz")
+    else:
+        for magic, name in UNREADABLE:
+            if first.startswith(magic):
+                raise SourceError(f"{name} data: bordercheck can't decode this format, so it wasn't searched")
+        if first:
+            yield first
+        yield from chunks
+
+
 def _iter_targets(src, values=None):
     """Yield (where, chunk iterator) pairs for one configured source.
 
@@ -193,15 +344,15 @@ def _iter_targets(src, values=None):
             if not os.path.exists(root):
                 raise SourceError(f"{root} does not exist")
             if os.path.isfile(root):
-                yield root, _file_chunks(root)
+                yield root, _decode(_file_chunks(root))
                 continue
             for dirpath, _dirs, files in os.walk(root):
                 for name in sorted(files):
                     full = os.path.join(dirpath, name)
-                    yield full, _file_chunks(full)
+                    yield full, _decode(_file_chunks(full))
     elif kind == "command":
         command = require_env(render(src["command"], values))
-        yield "command output", _command_chunks(command, float(src.get("timeout_seconds", 300)))
+        yield "command output", _decode(_command_chunks(command, float(src.get("timeout_seconds", 300))))
     elif kind == "http":
         urls = [src["url"]] if isinstance(src["url"], str) else src["url"]
         headers = expand_env(dict(src.get("headers", {})))
@@ -210,9 +361,9 @@ def _iter_targets(src, values=None):
             url = render(url, values)
             if "{{page}}" in url:
                 for page, body in _http_pages(url, headers, src.get("ca_file"), timeout, int(src.get("max_pages", 20))):
-                    yield url.replace("{{page}}", str(page)), iter([body])
+                    yield url.replace("{{page}}", str(page)), _decode([body])
             else:
-                yield url, _http_chunks(url, headers, src.get("ca_file"), timeout)
+                yield url, _decode(_http_chunks(url, headers, src.get("ca_file"), timeout))
 
 
 def _safe_error(e):
