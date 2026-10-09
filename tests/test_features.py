@@ -9,7 +9,7 @@ import time
 import unittest
 import zipfile
 
-from bordercheck import canary, cli, evidence, onepager, report, scan
+from bordercheck import canary, cli, evidence, onepager, report, scan, term
 from test_bordercheck import Quiet, serve
 
 
@@ -192,11 +192,15 @@ concurrency = 8
         self.assertEqual(s["phases"]["baseline"]["public_hosts"], [])
         self.assertEqual(s["phases"]["probe:context_window"]["public_hosts"], ["api.openai.com"])
         self.assertEqual(s["phases"]["probe:rate_limit"]["public_hosts"], ["api.openai.com"])
-        self.assertTrue(any(r.startswith("Long prompt") for r in s["reasons"]))
-        heads = [f["headline"] for f in s["findings"]]
-        self.assertIn("A public model API answered with nothing down, because the prompt was too long for the local model.", heads)
-        self.assertIn("A public model API answered with nothing down, because of a burst of traffic.", heads)
+        host_reasons = [r for r in s["reasons"] if "api.openai.com answered during" in r]
+        self.assertEqual(len(host_reasons), 1)
+        self.assertIn("Long prompt", host_reasons[0])
+        self.assertIn("Burst of requests", host_reasons[0])
+        heads = [f["headline"] for f in s["findings"] if f["headline"].startswith("A public model API")]
+        self.assertEqual(heads, ["A public model API (api.openai.com) answered."])
         self.assertEqual(s["findings"][0]["severity"], "fail")
+        self.assertIn("prompt was too long", s["findings"][0]["detail"])
+        self.assertIn("burst of traffic", s["findings"][0]["detail"])
 
     def test_allowed_destinations_cover_served_by_hosts(self):
         with tempfile.TemporaryDirectory() as d:
@@ -286,6 +290,59 @@ class OnePagerTests(unittest.TestCase):
         self.assertNotIn("<script>", page)
         self.assertIn("&lt;script&gt;", page)
         self.assertIn("Regulation (EU) 2022/2554", page)
+        self.assertIn("their contract says what they keep", page)
+        self.assertIn("those logs are another store", page)
+        self.assertNotIn("scan them too", page)
+
+    def test_served_by_shows_host_and_model_not_the_raw_url(self):
+        cfg = {"border": {"allowed_locations": ["DE"]}, "watch_destinations": []}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": canary.new_record(),
+               "requests": [{"phase": "fault", "status": 200, "seconds": 0.1,
+                             "fields": {"model": "gpt-4o-mini"},
+                             "headers": {"x-litellm-model-api-base": "https://api.openai.com/v1"}}]}
+        page = onepager.html(report.build(cfg, run, [])[1])
+        cell = page.split("<code>")[1].split("</code>")[0]
+        self.assertIn("gpt-4o-mini", cell)
+        self.assertIn("api.openai.com", cell)
+        self.assertNotIn("https://", cell)
+        self.assertIn("https://api.openai.com/v1", page)  # kept on the title attribute
+
+    def test_unseen_source_is_not_called_clean(self):
+        cfg = {"border": {"allowed_locations": ["DE"]}, "watch_destinations": []}
+        run = {"run_id": "run-20260101-000000-abcd", "environment": "lab", "created": 0, "events": [],
+               "record": canary.new_record(), "requests": []}
+        unseen = [{"name": "Vector store", "layer": "model_state", "location": "DE", "hits": [],
+                   "errors": [], "targets_scanned": 1, "truncated": []}]
+        page = onepager.html(report.build(cfg, run, unseen)[1])
+        self.assertIn("Not observed", page)
+        self.assertNotIn("Checked, clean", page)
+        seen = [{"name": "Gateway logs", "layer": "logs", "location": "DE",
+                 "hits": [{"kind": "run_id", "label": "harness request id", "where": "x"}],
+                 "errors": [], "targets_scanned": 1, "truncated": []}]
+        page = onepager.html(report.build(cfg, run, seen)[1])
+        self.assertIn("Checked, clean", page)
+        self.assertNotIn("Not observed", page)
+
+
+class ColorTests(unittest.TestCase):
+    def test_color_follows_tty_and_no_color(self):
+        class Tty:
+            def isatty(self):
+                return True
+
+        class Pipe:
+            def isatty(self):
+                return False
+
+        os.environ.pop("NO_COLOR", None)
+        self.assertTrue(term.paint("FAIL", "31", Tty()).startswith("\033"))
+        self.assertEqual(term.paint("FAIL", "31", Pipe()), "FAIL")
+        os.environ["NO_COLOR"] = "1"
+        try:
+            self.assertEqual(term.paint("FAIL", "31", Tty()), "FAIL")
+        finally:
+            os.environ.pop("NO_COLOR", None)
 
 
 if __name__ == "__main__":

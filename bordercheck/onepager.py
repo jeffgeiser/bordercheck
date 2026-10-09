@@ -9,7 +9,7 @@ from html import escape
 import time
 
 from .config import LAYERS
-from .report import KIND_NAMES, PHASE_LABELS
+from .report import KIND_NAMES, PHASE_LABELS, _hosts
 
 LAYER_TITLES = {
     "data": ("Data", "where it's stored"),
@@ -37,7 +37,7 @@ FRAMEWORKS = [
     ("EBA Guidelines on outsourcing arrangements (EBA/GL/2019/02)", None,
      "Firms must know where data is stored and processed and test their continuity plans."),
     ("EU AI Act, Regulation (EU) 2024/1689, Art. 12", "https://eur-lex.europa.eu/eli/reg/2024/1689/oj",
-     "Required event logs are themselves stores with a residency footprint; scan them too."),
+     "If event logs are required, those logs are another store. This run checks whether they hold the customer and where they sit."),
 ]
 
 CSS = """
@@ -68,6 +68,7 @@ h1{font-size:20px;margin:0}h2{font-size:13px;text-transform:uppercase;letter-spa
 .layer .why{font-size:12px;margin-top:6px}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}
+td.cond{white-space:nowrap}
 th{color:var(--muted);font-weight:600;font-size:12px}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
 a{color:var(--link)}
@@ -100,7 +101,30 @@ def _layer_status(layer, r):
         return "st-warn", "Copies inside border", ", ".join(inside)
     if any(s["errors"] for s in srcs):
         return "st-warn", "Incomplete", "A source had errors"
+    # Saw the request and kept no identifiers: clean. Never saw the request: not the same thing.
+    unseen = [s["name"] for s in srcs
+              if not s["egress"] and not s["saw_request_ids"] and not s["identifiers"]]
+    if unseen:
+        return "st-warn", "Not observed", "Never saw the request: " + ", ".join(unseen)
     return "st-pass", "Checked, clean", f"{len(srcs)} source(s) scanned"
+
+
+def _short_served(label):
+    """model plus hostname, not the raw gateway header. 'model=gpt-4o-mini, x-litellm-model-api-base=https://api.openai.com/v1' -> 'gpt-4o-mini · api.openai.com'."""
+    if label.startswith("(no served-by"):
+        return label
+    model, host = None, None
+    for piece in str(label).split(", "):
+        if "=" not in piece:
+            continue
+        key, val = piece.split("=", 1)
+        hosts = _hosts(val)
+        if hosts and host is None:
+            host = hosts[0]
+        if key == "model" or key.endswith("-model") or key.endswith("_model"):
+            model = val
+    shown = " · ".join(part for part in (model, host) if part)
+    return shown or label
 
 
 def html(r, frameworks=False):
@@ -136,9 +160,10 @@ def html(r, frameworks=False):
 
     out.append("<h2>Who answered</h2><table><tr><th>Condition</th><th class='num'>Answered</th><th>Served by</th></tr>")
     for name, p in r["phases"].items():
-        served = "; ".join(f"{k} ({c})" for k, c in p["served_by"].items()) or ", ".join(p["errors"]) or "-"
-        out.append(f"<tr><td>{e(PHASE_LABELS.get(name, name))}</td><td class='num'>{p['answered']} / {p['sent']}</td>"
-                   f"<td><code>{e(served)}</code></td></tr>")
+        served = "; ".join(f"{_short_served(k)} ({c})" for k, c in p["served_by"].items()) or ", ".join(p["errors"]) or "-"
+        title = "; ".join(f"{k} ({c})" for k, c in p["served_by"].items())
+        out.append(f"<tr><td class='cond'>{e(PHASE_LABELS.get(name, name))}</td><td class='num'>{p['answered']} / {p['sent']}</td>"
+                   f"<td title='{e(title)}'><code>{e(served)}</code></td></tr>")
     out.append("</table>")
 
     kinds = r.get("kinds_sent", [])
@@ -152,7 +177,7 @@ def html(r, frameworks=False):
         out.append("</table>")
 
     out.append("<h2>Not covered</h2><ul class='plain small'>"
-               "<li>What a fallback provider keeps on its side; their data-processing terms decide that.</li>"
+               "<li>What the model provider stores after a request leaves. This run can show that data reached them; their contract says what they keep.</li>"
                "<li>Stores not listed as sources, and backups made after the run.</li>"
                "<li>Payload contents on links without TLS inspection (destinations only).</li>"
                + "".join(f"<li>{e(n)}: outside the border and can't show it saw this run, so its clean result is unverified.</li>"

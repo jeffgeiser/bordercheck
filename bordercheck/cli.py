@@ -10,6 +10,7 @@ import os
 import time
 
 from . import canary, config, evidence, fault, onepager, report, runs, scan, send
+from .term import paint
 
 
 def _cfg(args):
@@ -165,7 +166,8 @@ def cmd_report(args):
     runs.write(cfg, args.run, evidence.MANIFEST, json.dumps(
         evidence.manifest(path, args.config, args.run, summary["verdict"]), indent=2))
     print(f"report: {path}/report.md  (one-pager: summary.html)")
-    print(f"verdict: {summary['verdict'].upper()}" + "".join(f"\n  - {r}" for r in summary["reasons"]))
+    color = {"pass": "1;32", "fail": "1;31", "inconclusive": "1;33"}[summary["verdict"]]
+    print(f"verdict: {paint(summary['verdict'].upper(), color)}" + "".join(f"\n  - {r}" for r in summary["reasons"]))
     return report.EXIT_CODES[summary["verdict"]]
 
 
