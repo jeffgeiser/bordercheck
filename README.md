@@ -19,9 +19,9 @@ Add `--pace 0.3` to slow the output down (about 12 seconds) for a screen recordi
 
 It writes a full run to `demo-runs/`: `report.md`, `summary.json` and the one-page `summary.html`, which starts like this:
 
-![bordercheck one-page summary from the demo stack: FAIL, with plain-language findings and the four residency layers](docs/images/demo-summary.png)
+![bordercheck one-page summary from the demo stack: FAIL, with plain-language findings and the four residency layers](https://raw.githubusercontent.com/jeffgeiser/bordercheck/main/docs/images/demo-summary.png)
 
-The simulated stack has a LiteLLM-style gateway that falls back to a public API on long prompts and when the local model is down, tracing that stores requests base64-encoded, a US-hosted log service, a semantic cache and an egress proxy. The full report is in [`docs/sample-report.md`](docs/sample-report.md).
+The simulated stack has a LiteLLM-style gateway that falls back to a public API on long prompts and when the local model is down, tracing that stores requests base64-encoded, a US-hosted log service, a semantic cache and an egress proxy. The full report is in [`docs/sample-report.md`](https://github.com/jeffgeiser/bordercheck/blob/main/docs/sample-report.md).
 
 ## What counts as a border
 
@@ -102,7 +102,7 @@ A manifest makes changes detectable, not impossible: anyone who can rewrite the 
 
 ## Quick start
 
-Requires Python 3.11 or newer. Nothing to install beyond that.
+Requires Python 3.11 or newer, with no other dependencies. Install from PyPI with `pipx install bordercheck` (or `pip install bordercheck`), and replace `python -m bordercheck` below with `bordercheck`. Pin a version (`bordercheck==0.1.0`) in a CI gate. To run from a clone instead:
 
 ```bash
 git clone https://github.com/jeffgeiser/bordercheck && cd bordercheck

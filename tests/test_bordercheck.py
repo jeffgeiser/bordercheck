@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 
+import bordercheck
 from bordercheck import canary, cli, config, report, runs, scan, send
 
 
@@ -209,6 +210,13 @@ class ReportTests(unittest.TestCase):
         text, summary = report.build(cfg, run, scan_res)
         self.assertEqual(summary["egress_outside_border"], ["bedrock-runtime.us-east-1.amazonaws.com"])
         self.assertIn("allowed_destinations", text)
+        self.assertEqual(summary["bordercheck_version"], bordercheck.__version__)
+
+    def test_new_run_records_the_tool_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"output_dir": d, "environment": "lab", "border": {}}
+            run = runs.new_run(cfg, {"canary": "CNRY-TEST-0001"})
+            self.assertEqual(runs.load(cfg, run["run_id"])["bordercheck_version"], bordercheck.__version__)
 
 
 class VerdictTests(unittest.TestCase):

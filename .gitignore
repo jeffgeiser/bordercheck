@@ -3,3 +3,6 @@ runs/
 __pycache__/
 *.pyc
 demo-runs/
+dist/
+build/
+*.egg-info/

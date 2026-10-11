@@ -5,6 +5,8 @@ import re
 import secrets
 import time
 
+from . import __version__
+
 RUN_ID_RE = re.compile(r"^run-\d{8}-\d{6}-[0-9a-f]{4}$")
 
 
@@ -24,6 +26,7 @@ def new_run(cfg, record):
     os.makedirs(path, mode=0o700, exist_ok=False)
     run = {
         "run_id": run_id,
+        "bordercheck_version": __version__,
         "environment": cfg["environment"],
         "border": cfg["border"],
         "created": time.time(),

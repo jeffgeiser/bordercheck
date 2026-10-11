@@ -9,6 +9,7 @@ import time
 import urllib.parse
 from collections import Counter
 
+from . import __version__
 from .canary import IDENTIFIER_KINDS
 from .config import LAYERS
 from .scan import MAX_HITS_PER_PATTERN, _watch_regex
@@ -527,4 +528,5 @@ def build(cfg, run, scan, redact=False):
     """(report.md text, summary dict). summary.json is the analysis minus error text."""
     r = analyze(cfg, run, scan, redact)
     summary = {k: v for k, v in r.items() if k != "errors_detail"}
+    summary["bordercheck_version"] = __version__
     return markdown(r), summary
