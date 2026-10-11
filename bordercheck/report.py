@@ -29,8 +29,8 @@ PROBE_NAMES = {
 }
 
 NOT_COVERED = [
-    "What the fallback provider keeps on its side (retention, abuse-monitoring logs, backups). "
-    "Check their data-processing terms; this harness can only show that data reached them.",
+    "What the model provider stores after a request leaves (its retention, abuse monitoring, backups). "
+    "This run can show that data reached them. Their contract says what they do with it.",
     "Payload contents on encrypted links you don't inspect. Without TLS inspection, egress evidence "
     "shows where requests went, not what they carried.",
     "Stores you didn't list as sources. A clean result covers only what was scanned.",
@@ -110,16 +110,28 @@ def _unverified_outside(s):
     return not s["inside"] and not s["identifiers"] and not s["errors"] and not s["saw_request_ids"]
 
 
+def _public_host_reasons(phases):
+    """One reason per public host, naming every phase that reached it. Probe and fault used to
+    repeat the same sentence."""
+    grouped = {}
+    for name, p in phases.items():
+        for host in p["public_hosts"]:
+            grouped.setdefault(host, []).append(
+                f"{PHASE_LABELS.get(name, name)} ({p['answered']} of {p['sent']})")
+    return [f"{host} answered during {_join(parts)}, a public model API the border doesn't allow"
+            for host, parts in sorted(grouped.items())]
+
+
 def verdict(sources, outside, dests_out, phases):
     """("pass" | "fail" | "inconclusive", reasons).
 
     A leak that was found is real whatever else went wrong, so fail wins. A pass needs evidence
-    that scanning works (a positive control that found the customer) and no source errors.
+    that scanning works (a positive control that found the customer), no source errors, and no
+    store other than that control still holding the customer inside the border.
     """
     fail = [f"identifiers found in {p['name']} ({p['location']}), outside the border" for p in outside]
     fail += [f"egress to {d}, a public model API the border doesn't allow" for d in dests_out]
-    fail += [f"{PHASE_LABELS.get(name, name)}: the gateway reports {', '.join(p['public_hosts'])} answered, "
-             "a public model API the border doesn't allow" for name, p in phases.items() if p["public_hosts"]]
+    fail += _public_host_reasons(phases)
     if fail:
         return "fail", fail
     unsure = []
@@ -133,10 +145,26 @@ def verdict(sources, outside, dests_out, phases):
     # Otherwise an empty export, a wrong time window or an unreadable format would pass.
     unsure += [f"{s['name']} ({s['location']}) is outside the border but never saw this run's requests, "
                "so its clean result proves nothing" for s in sources if _unverified_outside(s) and s["expect_request_ids"]]
+    # Redaction: the positive control is supposed to hold the customer. Any other in-border store
+    # that kept identifiers is a gap, and a pass would hide it. Not a border crossing, so this is
+    # inconclusive (exit 3) rather than fail.
+    unsure += [f"{s['name']} ({s['location']}) kept customer identifiers inside the border; "
+               "a pass allows that only for the positive control"
+               for s in sources if s["inside"] and s["identifiers"] and not s["positive_control"] and not s["egress"]]
     if not any(s["egress"] for s in sources):
-        # Unless the served-by fields name a host we can place, there's no telling where it ran.
-        unsure += [f"{PHASE_LABELS.get(name, name)}: a different backend answered and no egress source shows where it runs"
-                   for name, p in phases.items() if p["changed_backend"] and not p["allowed_hosts"]]
+        # Without an egress source, served-by fields are the only way to place a failover.
+        # An empty served-by (or a backend we cannot place) must not pass.
+        for name, p in phases.items():
+            if name == "baseline" or not p.get("answered"):
+                continue
+            if p["public_hosts"] or p["allowed_hosts"]:
+                continue
+            label = PHASE_LABELS.get(name, name)
+            if not p.get("has_served_by"):
+                unsure.append(f"{label}: requests were answered but no served-by field was recorded "
+                              "and no egress source shows where they went")
+            elif p["changed_backend"]:
+                unsure.append(f"{label}: a different backend answered and no egress source shows where it runs")
     return ("inconclusive", unsure) if unsure else ("pass", [])
 
 
@@ -156,15 +184,17 @@ def findings(r):
     def add(severity, headline, detail):
         out.append({"severity": severity, "headline": headline, "detail": detail})
 
+    when = {"fault": "while the local model was down",
+            "probe:context_window": "with nothing down, because the prompt was too long for the local model",
+            "probe:rate_limit": "with nothing down, because of a burst of traffic",
+            "probe:content_policy": "with nothing down, because the local model or a guardrail refused the prompt"}
+    grouped = {}
     for name, p in r["phases"].items():
-        if p["public_hosts"]:
-            when = {"fault": "while the local model was down",
-                    "probe:context_window": "with nothing down, because the prompt was too long for the local model",
-                    "probe:rate_limit": "with nothing down, because of a burst of traffic",
-                    "probe:content_policy": "with nothing down, because the local model or a guardrail refused the prompt",
-                    }.get(name, f"during {name}")
-            add("fail", f"A public model API answered {when}.",
-                f"The gateway reported {_join(p['public_hosts'])} for {p['answered']} of {p['sent']} requests.")
+        for host in p["public_hosts"]:
+            grouped.setdefault(host, []).append(
+                f"{p['answered']} of {p['sent']} {when.get(name, 'during ' + name)}")
+    for host, parts in grouped.items():
+        add("fail", f"A public model API ({host}) answered.", _join(parts) + ".")
     leaked = [s for s in r["sources"] if s["egress"] and s["identifiers"]]
     if leaked:
         add("fail", "The customer's data itself left, not just the requests.",
@@ -244,6 +274,7 @@ def analyze(cfg, run, scan, redact=False):
         info["allowed_hosts"] = sorted(h for h in hosts if _matches(h, approved))
         info["changed_backend"] = bool(name != "baseline" and base and info["answered"]
                                        and set(info["served_by"]) - set(base["served_by"]))
+        info["has_served_by"] = any(not str(k).startswith("(no served-by") for k in info["served_by"])
 
     sources, places = [], []
     kinds_planted = [k for k in IDENTIFIER_KINDS if k in run["record"]]
@@ -260,6 +291,7 @@ def analyze(cfg, run, scan, redact=False):
             "identifiers": bool(ident), "saw_request_ids": any(h["kind"] == "run_id" for h in s["hits"]),
             "kinds_found": sorted({h["kind"] for h in ident}, key=IDENTIFIER_KINDS.index),
             "truncated": bool(s["truncated"]),
+            "warnings": list(s.get("warnings") or []),
         }
         sources.append(src)
         if ident:
@@ -469,6 +501,8 @@ def markdown(r):
             reading = "egress source (request ids usually aren't visible here)"
         else:
             reading = "saw neither: off the request path, outside the time window, or not shipping logs"
+        if s.get("warnings"):
+            reading += " (" + "; ".join(s["warnings"]) + ")"
         L.append(f"| {s['name']} | {s['targets_scanned']} | {'yes' if s['saw_request_ids'] else 'no'} "
                  f"| {'yes' if s['identifiers'] else 'no'} | {reading} |")
     if any(s["truncated"] for s in r["sources"]):

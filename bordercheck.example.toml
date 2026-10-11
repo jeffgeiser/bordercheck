@@ -95,6 +95,8 @@ type = "command"
 # With -l, kubectl logs every matching pod (deployment/NAME picks just one) but defaults to the
 # last 10 lines per pod, so --tail=-1 matters.
 command = "kubectl -n ai-staging logs -l app=ai-gateway --all-containers --since-time={{run_started}} --tail=-1 --max-log-requests=20"
+# kubectl exits non-zero when one container fails, after printing the rest. That output is scanned.
+# allow_nonzero_exit = false   # treat any non-zero exit as a scan error instead
 layer = "logs"
 location = "DE"
 

@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 
 from . import net
+from .term import paint
 from .canary import IDENTIFIER_KINDS
 from .config import expand_env, require_env
 from .send import render
@@ -110,8 +111,25 @@ class SourceError(Exception):
     """An error whose message is safe to store: it never includes data read from the source."""
 
 
-def _command_chunks(command, timeout):
-    """Stream a shell command's stdout. stderr is shown on the terminal, never stored."""
+def _in_window(path, values):
+    """True if a file may contain this run. Files last modified before the window started cannot."""
+    if not values or "run_started_epoch" not in values:
+        return True
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return True
+    return mtime >= float(values["run_started_epoch"])
+
+
+def _command_chunks(command, timeout, meta, allow_nonzero):
+    """Stream a shell command's stdout. stderr is shown on the terminal, never stored.
+
+    A non-zero exit with output (kubectl logs does this when one container fails) is a warning,
+    not a failed scan, unless the source sets allow_nonzero_exit = false. No output, or a
+    timeout, is still an error: there is nothing usable to search.
+    """
+    produced = False
     with tempfile.TemporaryFile() as err:
         proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=err)
         killed = threading.Event()
@@ -122,6 +140,7 @@ def _command_chunks(command, timeout):
                 block = proc.stdout.read(CHUNK)
                 if not block:
                     break
+                produced = True
                 yield block
         finally:
             timer.cancel()
@@ -134,6 +153,9 @@ def _command_chunks(command, timeout):
                 print("\n    stderr: " + detail.replace("\n", "\n    ") + "\n   ", end="")
             if killed.is_set():
                 raise SourceError(f"command killed after {timeout:.0f}s timeout")
+            if allow_nonzero and produced:
+                meta.setdefault("warnings", []).append(f"command exited {code}; output was scanned")
+                return
             raise SourceError(f"command exited {code} (stderr shown on the terminal, not stored)")
 
 
@@ -180,12 +202,14 @@ def _http_pages(url, headers, ca_file, timeout, max_pages):
     print(f"\n    stopped at max_pages = {max_pages}; there may be more", end="")
 
 
-def _iter_targets(src, values=None):
+def _iter_targets(src, values=None, meta=None):
     """Yield (where, chunk iterator) pairs for one configured source.
 
     `where` comes from the config as written (before ${VAR} expansion), so it never holds secrets.
+    Path files last modified before the run window are skipped; `meta["warnings"]` records how many.
     """
     values = values or {}
+    meta = meta if meta is not None else {}
     kind = src["type"]
     if kind == "path":
         for root in [src["path"]] if isinstance(src["path"], str) else src["path"]:
@@ -193,15 +217,24 @@ def _iter_targets(src, values=None):
             if not os.path.exists(root):
                 raise SourceError(f"{root} does not exist")
             if os.path.isfile(root):
+                if not _in_window(root, values):
+                    meta["window_skipped"] = meta.get("window_skipped", 0) + 1
+                    continue
                 yield root, _file_chunks(root)
                 continue
             for dirpath, _dirs, files in os.walk(root):
                 for name in sorted(files):
                     full = os.path.join(dirpath, name)
+                    if not os.path.isfile(full):
+                        continue
+                    if not _in_window(full, values):
+                        meta["window_skipped"] = meta.get("window_skipped", 0) + 1
+                        continue
                     yield full, _file_chunks(full)
     elif kind == "command":
         command = require_env(render(src["command"], values))
-        yield "command output", _command_chunks(command, float(src.get("timeout_seconds", 300)))
+        allow = src.get("allow_nonzero_exit", True)
+        yield "command output", _command_chunks(command, float(src.get("timeout_seconds", 300)), meta, allow)
     elif kind == "http":
         urls = [src["url"]] if isinstance(src["url"], str) else src["url"]
         headers = expand_env(dict(src.get("headers", {})))
@@ -245,10 +278,11 @@ def scan_sources(cfg, needles, values=None):
         entry["positive_control"] = bool(src.get("positive_control"))
         # Egress logs rarely record request ids; every other store should, if it's on the path.
         entry["expect_request_ids"] = bool(src.get("expect_request_ids", not entry["egress"]))
-        entry.update(hits=[], targets_scanned=0, errors=[], truncated=[])
+        entry.update(hits=[], targets_scanned=0, errors=[], truncated=[], warnings=[])
         print(f"  scanning {src['name']} ...", end="", flush=True)
+        meta = {}
         try:
-            for where, chunks in _iter_targets(src, values):
+            for where, chunks in _iter_targets(src, values, meta):
                 failures = []
                 hits, truncated = scan_stream(_guard(chunks, failures), needles, watch if src.get("egress") else [])
                 if failures:
@@ -261,9 +295,14 @@ def scan_sources(cfg, needles, values=None):
                 entry["truncated"].extend(f"{where}: {t}" for t in truncated)
         except Exception as e:
             entry["errors"].append(_safe_error(e))
+        entry["warnings"].extend(meta.get("warnings", []))
+        skipped = meta.get("window_skipped", 0)
+        if skipped:
+            entry["warnings"].append(f"{skipped} file(s) not modified during the run window")
         n = sum(1 for h in entry["hits"] if h["kind"] in IDENTIFIER_KINDS)
-        print(f" {entry['targets_scanned']} target(s), {n} identifier hit(s)"
-              f"{', ERRORS' if entry['errors'] else ''}"
-              f"{'  (nothing to scan: check the path, query or time window)' if not entry['targets_scanned'] and not entry['errors'] else ''}")
+        hit_s = paint(f"{n} identifier hit(s)", "31" if n else "32")
+        err_s = paint(", ERRORS", "33") if entry["errors"] else ""
+        empty = "  (nothing to scan: check the path, query or time window)" if not entry["targets_scanned"] and not entry["errors"] else ""
+        print(f" {entry['targets_scanned']} target(s), {hit_s}{err_s}{empty}")
         results.append(entry)
     return results
