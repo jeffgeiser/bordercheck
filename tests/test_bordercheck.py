@@ -122,10 +122,19 @@ class SourceSafetyTests(unittest.TestCase):
         self.assertTrue(any("exited 3" in e for e in res["errors"]))
         self.assertEqual(len(res["hits"]), 1, "hits before the failure are kept")
 
+    def test_compressed_output_with_nonzero_exit_is_decoded(self):
+        # #4 (lenient non-zero exit) and #13 (decode by content) together: gzip output from a
+        # command that then exits non-zero is still decompressed and searched, with a warning.
+        res = scan_one({"type": "command", "command": "echo CNRY-TEST-0001 | gzip; exit 3"})
+        self.assertFalse(res["errors"])
+        self.assertTrue(any("exited 3" in w for w in res["warnings"]))
+        self.assertEqual(len(res["hits"]), 1)
+
     def test_bad_gzip_error_does_not_quote_file_contents(self):
         with tempfile.TemporaryDirectory() as d:
-            with open(os.path.join(d, "x.gz"), "wb") as f:
-                f.write(b"CNRY-TEST-0001 not gzip")
+            # gzip magic bytes, then garbage that happens to contain the canary
+            with open(os.path.join(d, "x.log"), "wb") as f:
+                f.write(b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xffCNRY-TEST-0001 corrupt deflate data")
             res = scan_one({"type": "path", "path": d})
         self.assertTrue(res["errors"])
         self.assertNotIn("CNRY", json.dumps(res))
